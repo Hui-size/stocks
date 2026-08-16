@@ -3,6 +3,7 @@ from plotly.subplots import make_subplots
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from time import perf_counter
 
 from ai_interpreter import AIInterpreterError, generate_stock_interpretation
 from analysis import build_analysis, detect_anomaly_flags, estimate_support_resistance
@@ -509,13 +510,13 @@ def get_backtest_dataset(
     )
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def get_realtime_quote_dataset(stock_code: str) -> dict:
     """带短缓存获取实时行情快照。"""
     return fetch_realtime_quote(stock_code)
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def get_realtime_minute_dataset(stock_code: str) -> pd.DataFrame:
     """带短缓存获取实时分时走势。"""
     return fetch_realtime_minute(stock_code)
@@ -1323,25 +1324,49 @@ def render_stock_detail(stock_code: str, days: int, show_export: bool = False, a
     col1.metric("当前价格 / 最近收盘价", format_metric_value(latest_price))
     col2.metric("涨跌幅", format_metric_value(pct_chg, "%"))
     col3.metric("成交量", f"{df.iloc[-1]['volume'] / 10000:.2f} 万手")
-    col4.metric("趋势判断", analysis_result.get("趋势判断", "暂无"))
+    trend_strength = int(analysis_result.get("趋势强度", 0) or 0)
+    col4.metric(
+        "趋势判断",
+        analysis_result.get("趋势判断", "暂无"),
+        delta=f"{trend_strength:+d} · {analysis_result.get('趋势置信度', '低')}置信度",
+        help=analysis_result.get("趋势判断依据", "综合多周期价格、均线、波动率与趋势效率判断。"),
+    )
 
     render_anomaly_panel(df)
     render_support_resistance_panel(df)
 
     try:
-        update_run_status(run_status, "正在加载实时行情和分时走势...", state="running")
+        update_run_status(run_status, "正在加载实时行情...", state="running")
+        quote_started_at = perf_counter()
         quote = get_realtime_quote_dataset(code)
-        minute_df = get_realtime_minute_dataset(code)
-        update_run_status(run_status, "实时行情和分时走势已加载。", state="running")
-        st.subheader("实时行情与分时走势")
+        quote_elapsed = perf_counter() - quote_started_at
+        update_run_status(run_status, "实时行情已加载。", state="running")
+        st.subheader("实时行情")
         realtime_cols = st.columns(5)
         realtime_cols[0].metric("实时最新价", format_metric_value(quote.get("latest_price")))
         realtime_cols[1].metric("实时涨跌幅", format_metric_value(quote.get("pct_chg"), "%"))
         realtime_cols[2].metric("今日最高", format_metric_value(quote.get("high")))
         realtime_cols[3].metric("今日最低", format_metric_value(quote.get("low")))
         realtime_cols[4].metric("实时成交额", f"{(quote.get('amount') or 0) / 100000000:.2f} 亿元")
-        st.caption(f"实时来源：{quote.get('source')}，时间戳：{quote.get('timestamp', '暂无')}。")
-        st.plotly_chart(build_realtime_minute_figure(minute_df, quote), use_container_width=True, config=get_plotly_config())
+        st.caption(
+            f"实时来源：{quote.get('source')}，时间戳：{quote.get('timestamp', '暂无')}，"
+            f"加载耗时：{quote_elapsed:.2f} 秒。"
+        )
+        show_minute_chart = st.toggle(
+            "显示分时走势",
+            value=False,
+            key=f"show_realtime_minute_{code}",
+            help="分时数据按需加载，避免拖慢技术分析主体。",
+        )
+        if show_minute_chart:
+            minute_started_at = perf_counter()
+            with st.spinner("正在加载分时走势..."):
+                minute_df = get_realtime_minute_dataset(code)
+            minute_elapsed = perf_counter() - minute_started_at
+            st.caption(f"分时数据加载耗时：{minute_elapsed:.2f} 秒；缓存 120 秒。")
+            st.plotly_chart(build_realtime_minute_figure(minute_df, quote), use_container_width=True, config=get_plotly_config())
+        else:
+            st.caption("分时图已改为按需加载；需要查看时打开上方开关。")
     except RealtimeQuoteError as exc:
         update_run_status(run_status, "实时行情暂不可用，继续展示历史分析。", state="running")
         st.warning(str(exc))
@@ -1431,31 +1456,49 @@ def render_short_term_prediction(
 
     render_prediction_precheck(result.get("data"))
 
-    try:
-        update_run_status(run_status, "正在加载实时行情用于对比...", state="running")
-        quote = get_realtime_quote_dataset(code)
-        comparison = compare_realtime_with_prediction(quote, result)
-        st.subheader("实时行情对比")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("实时最新价", format_metric_value(quote.get("latest_price")))
-        col2.metric("实时涨跌幅", format_metric_value(quote.get("pct_chg"), "%"))
-        col3.metric("成交额", f"{(quote.get('amount') or 0) / 100000000:.2f} 亿元")
-        col4.metric("预测 vs 实时", comparison["对比结论"])
-        st.caption(
-            f"实时来源：{quote.get('source')}，时间戳：{quote.get('timestamp', '暂无')}。"
-            f"1日预测方向：{comparison['预测方向']}，实时盘中方向：{comparison['实时方向']}。{comparison['说明']}"
-        )
-        with st.expander("查看实时分时走势图", expanded=True):
-            update_run_status(run_status, "正在加载实时分时走势图...", state="running")
-            minute_df = get_realtime_minute_dataset(code)
-            st.plotly_chart(build_realtime_minute_figure(minute_df, quote), use_container_width=True, config=get_plotly_config())
-        update_run_status(run_status, "实时行情对比已完成。", state="running")
-    except RealtimeQuoteError as exc:
-        update_run_status(run_status, "实时行情暂不可用，继续展示预测结果。", state="running")
-        st.warning(str(exc))
-    except Exception as exc:
-        update_run_status(run_status, "实时行情对比暂不可用，继续展示预测结果。", state="running")
-        st.warning(f"实时行情对比暂不可用：{exc}")
+    st.subheader("实时行情对比（可选）")
+    show_realtime_comparison = st.toggle(
+        "加载实时行情对比",
+        value=False,
+        key=f"show_prediction_realtime_{code}",
+        help="预测结果会优先显示；需要盘中对比时再加载实时行情。",
+    )
+    if show_realtime_comparison:
+        try:
+            update_run_status(run_status, "正在加载实时行情用于对比...", state="running")
+            quote = get_realtime_quote_dataset(code)
+            comparison = compare_realtime_with_prediction(quote, result)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("实时最新价", format_metric_value(quote.get("latest_price")))
+            col2.metric("实时涨跌幅", format_metric_value(quote.get("pct_chg"), "%"))
+            col3.metric("成交额", f"{(quote.get('amount') or 0) / 100000000:.2f} 亿元")
+            col4.metric("预测 vs 实时", comparison["对比结论"])
+            st.caption(
+                f"实时来源：{quote.get('source')}，时间戳：{quote.get('timestamp', '暂无')}。"
+                f"1日预测方向：{comparison['预测方向']}，实时盘中方向：{comparison['实时方向']}。{comparison['说明']}"
+            )
+            show_prediction_minute = st.toggle(
+                "显示实时分时走势",
+                value=False,
+                key=f"show_prediction_minute_{code}",
+            )
+            if show_prediction_minute:
+                update_run_status(run_status, "正在加载实时分时走势图...", state="running")
+                minute_df = get_realtime_minute_dataset(code)
+                st.plotly_chart(
+                    build_realtime_minute_figure(minute_df, quote),
+                    use_container_width=True,
+                    config=get_plotly_config(),
+                )
+            update_run_status(run_status, "实时行情对比已完成。", state="running")
+        except RealtimeQuoteError as exc:
+            update_run_status(run_status, "实时行情暂不可用，继续展示预测结果。", state="running")
+            st.warning(str(exc))
+        except Exception as exc:
+            update_run_status(run_status, "实时行情对比暂不可用，继续展示预测结果。", state="running")
+            st.warning(f"实时行情对比暂不可用：{exc}")
+    else:
+        st.caption("实时对比和分时图已改为按需加载，不再阻塞预测结果。")
 
     rows = []
     for item in result["predictions"]:

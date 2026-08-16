@@ -8,8 +8,14 @@ from prediction import (
     add_prediction_labels,
     build_features,
     fetch_prediction_history,
+    _blend_probabilities,
+    _confidence_from_probs,
+    _extract_ensemble_probs,
+    _fit_model_ensemble,
+    _refit_model_ensemble,
+    _recent_label_probs,
+    _rule_probabilities,
 )
-from sklearn.ensemble import RandomForestClassifier
 
 
 def _safe_accuracy(df: pd.DataFrame) -> float | None:
@@ -23,9 +29,11 @@ def _fit_predict_window(
     train_df: pd.DataFrame,
     test_row: pd.Series,
     label_col: str,
+    horizon: int,
     fitted_model=None,
+    ensemble_template=None,
 ) -> tuple[dict, object | None]:
-    """按需训练历史窗口模型，并返回单个样本的方向、概率和可复用模型。"""
+    """按需训练与线上一致的时间隔离集成，并返回单个历史预测。"""
     if fitted_model is None:
         train_df = train_df.dropna(subset=FEATURE_COLUMNS + [label_col])
     if fitted_model is None and (len(train_df) < 160 or train_df[label_col].nunique() < 2):
@@ -39,28 +47,33 @@ def _fit_predict_window(
         }, None
     model = fitted_model
     if model is None:
-        model = RandomForestClassifier(
-            n_estimators=40,
-            max_depth=5,
-            min_samples_leaf=8,
-            random_state=42,
-            class_weight="balanced",
-            n_jobs=-1,
-        )
-        model.fit(train_df[FEATURE_COLUMNS], train_df[label_col])
-    probabilities = {label: 0.0 for label in LABELS}
-    for label, value in zip(model.classes_, model.predict_proba(test_row[FEATURE_COLUMNS].to_frame().T)[0]):
-        probabilities[str(label)] = float(value)
+        if ensemble_template is None:
+            model = _fit_model_ensemble(train_df[FEATURE_COLUMNS], train_df[label_col], horizon)
+        else:
+            model = _refit_model_ensemble(ensemble_template, train_df[FEATURE_COLUMNS], train_df[label_col])
+    if model is None:
+        return {
+            "predicted": "震荡",
+            "up_prob": 0.2,
+            "flat_prob": 0.6,
+            "down_prob": 0.2,
+            "confidence": "低",
+            "model": "历史回放规则回退",
+        }, None
+    model_probs = _extract_ensemble_probs(model, test_row)
+    recent_probs = _recent_label_probs(train_df, label_col)
+    rule_probs, _, _, _ = _rule_probabilities(test_row, horizon)
+    probabilities = _blend_probabilities(model_probs, recent_probs, rule_probs, model["cv_score"])
     predicted = max(probabilities, key=probabilities.get)
-    top_probability = probabilities[predicted]
-    confidence = "高" if top_probability >= 0.58 else ("中" if top_probability >= 0.43 else "低")
     return {
         "predicted": predicted,
         "up_prob": probabilities["上涨"],
         "flat_prob": probabilities["震荡"],
         "down_prob": probabilities["下跌"],
-        "confidence": confidence,
-        "model": "历史滚动随机森林",
+        "confidence": _confidence_from_probs(probabilities, model["cv_score"], low_reliability=False),
+        "model": f"历史滚动时间隔离集成（{model['name']}）",
+        "validation_balanced_accuracy": model["cv_score"],
+        "validation_log_loss": model["cv_log_loss"],
     }, model
 
 
@@ -93,7 +106,9 @@ def rolling_backtest(
         minimum_history = 160 + horizon - 1
         start = max(minimum_history, len(usable) - test_days)
         fitted_model = None
+        ensemble_template = None
         model_train_samples = 0
+        retrain_count = 0
         for idx in range(start, len(usable)):
             # 在测试日只能使用目标结果已经发生的训练标签。
             train_end = idx - horizon + 1
@@ -104,12 +119,19 @@ def rolling_backtest(
             if should_retrain:
                 fitted_model = None
                 model_train_samples = len(train_df)
+                retrain_count += 1
+                if retrain_count == 1 or (retrain_count - 1) % 3 == 0:
+                    ensemble_template = None
             prediction, fitted_model = _fit_predict_window(
                 train_df,
                 test_row,
                 label_col,
+                horizon,
                 fitted_model=fitted_model,
+                ensemble_template=ensemble_template,
             )
+            if fitted_model is not None:
+                ensemble_template = fitted_model
             rows.append(
                 {
                     "date": test_row["date"],
@@ -123,6 +145,8 @@ def rolling_backtest(
                     "down_prob": prediction["down_prob"],
                     "confidence": prediction["confidence"],
                     "model": prediction["model"],
+                    "validation_balanced_accuracy": prediction.get("validation_balanced_accuracy"),
+                    "validation_log_loss": prediction.get("validation_log_loss"),
                     "train_samples": model_train_samples,
                     "label_threshold": float(test_row.get(f"label_threshold_{horizon}d", threshold)),
                     "threshold_mode": normalized_mode,
@@ -149,6 +173,8 @@ def rolling_backtest(
         "note": (
             "回测使用滚动训练方式，每个测试点只使用当时已经发生并可获得结果的历史标签训练，"
             f"2-3 日标签也会等待对应周期结束后才进入训练；模型每 {max(1, retrain_interval)} 个交易日重新训练一次以控制耗时。"
+            "预测与线上一致，使用带标签周期隔离区的时间序列验证、近期状态加权和双模型集成。"
+            "回测中每 3 次重训重新选择一次模型组合，其余重训沿用最近一次组合以控制计算耗时。"
             "历史表现不代表未来一定准确。"
         ),
     }

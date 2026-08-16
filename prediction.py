@@ -1,16 +1,17 @@
-from datetime import date, timedelta
-from math import sqrt
+from math import log, sqrt
 
 import akshare as ak
 import pandas as pd
-from sklearn.ensemble import ExtraTreesClassifier, GradientBoostingClassifier, RandomForestClassifier
+import requests
+from sklearn.base import clone
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import balanced_accuracy_score, log_loss
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from data_fetch import DataFetchError, normalize_stock_code
+from data_fetch import DataFetchError, code_with_market_prefix, normalize_stock_code
 
 
 LABELS = ["上涨", "震荡", "下跌"]
@@ -28,29 +29,33 @@ FEATURE_COLUMNS = [
     "dev_ma10",
     "dev_ma20",
     "dev_ma60",
-    "MA5",
-    "MA10",
-    "MA20",
-    "MA60",
     "ma5_slope",
     "ma10_slope",
     "ma20_slope",
+    "ma_spread_5_20",
+    "ma_spread_10_60",
     "ma_bull",
     "ma_bear",
-    "DIF",
-    "DEA",
-    "MACD",
-    "macd_change",
+    "dif_pct",
+    "dea_pct",
+    "macd_pct",
+    "macd_change_pct",
     "RSI6",
     "RSI12",
     "RSI24",
+    "rsi12_change_3d",
     "volatility_5d",
     "volatility_10d",
     "volatility_20d",
+    "volatility_ratio_5_20",
     "amplitude",
     "high_low_range",
+    "atr_14",
+    "boll_width",
+    "boll_position",
     "volume_ratio_5d",
     "volume_ratio_20d",
+    "volume_zscore_20",
     "volume_up",
     "volume_down",
     "shrink_up",
@@ -69,6 +74,11 @@ FEATURE_COLUMNS = [
     "consecutive_down_3d",
     "new_high_20d",
     "new_low_20d",
+    "distance_high_20d",
+    "distance_low_20d",
+    "drawdown_60d",
+    "trend_efficiency_10d",
+    "trend_efficiency_20d",
 ]
 
 
@@ -101,29 +111,25 @@ def next_trade_dates(last_date, count: int = 3) -> tuple[list[pd.Timestamp], str
 
 
 def fetch_prediction_history(stock_code: str, years: int = 3) -> pd.DataFrame:
-    """使用 AKShare 获取至少最近三年的前复权日 K 数据。"""
+    """通过腾讯单股票接口获取至少最近三年的前复权日 K 数据。"""
     code = normalize_stock_code(stock_code)
-    end = date.today()
-    start = end - timedelta(days=365 * years + 120)
+    symbol = code_with_market_prefix(code)
+    row_limit = max(760, years * 250 + 120)
     try:
-        raw_df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=start.strftime("%Y%m%d"),
-            end_date=end.strftime("%Y%m%d"),
-            adjust="qfq",
+        response = requests.get(
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+            params={"param": f"{symbol},day,,,{row_limit},qfq"},
+            timeout=6,
+        )
+        response.raise_for_status()
+        payload = response.json().get("data", {}).get(symbol, {})
+        rows = payload.get("qfqday") or payload.get("day") or []
+        raw_df = pd.DataFrame(
+            [row[:6] for row in rows],
+            columns=["date", "open", "close", "high", "low", "volume"],
         )
     except Exception as exc:
-        try:
-            market = "sh" if code.startswith(("6", "9")) else "sz"
-            raw_df = ak.stock_zh_a_daily(
-                symbol=f"{market}{code}",
-                start_date=start.strftime("%Y%m%d"),
-                end_date=end.strftime("%Y%m%d"),
-                adjust="qfq",
-            )
-        except Exception as fallback_exc:
-            raise DataFetchError("前复权历史行情获取失败，请稍后重试或检查网络代理。") from fallback_exc
+        raise DataFetchError("前复权历史行情获取失败，请稍后重试或检查网络代理。") from exc
 
     if raw_df is None or raw_df.empty:
         raise DataFetchError("前复权历史行情为空，无法进行短线预测。")
@@ -181,6 +187,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     data["ma5_slope"] = data["MA5"].pct_change(3)
     data["ma10_slope"] = data["MA10"].pct_change(3)
     data["ma20_slope"] = data["MA20"].pct_change(5)
+    data["ma_spread_5_20"] = data["MA5"] / data["MA20"] - 1
+    data["ma_spread_10_60"] = data["MA10"] / data["MA60"] - 1
     data["ma_bull"] = ((data["MA5"] > data["MA10"]) & (data["MA10"] > data["MA20"])).astype(int)
     data["ma_bear"] = ((data["MA5"] < data["MA10"]) & (data["MA10"] < data["MA20"])).astype(int)
 
@@ -190,18 +198,43 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     data["DEA"] = data["DIF"].ewm(span=9, adjust=False).mean()
     data["MACD"] = (data["DIF"] - data["DEA"]) * 2
     data["macd_change"] = data["MACD"].diff()
+    data["dif_pct"] = data["DIF"] / close
+    data["dea_pct"] = data["DEA"] / close
+    data["macd_pct"] = data["MACD"] / close
+    data["macd_change_pct"] = data["macd_change"] / close
     data["RSI6"] = _rsi(close, 6)
     data["RSI12"] = _rsi(close, 12)
     data["RSI24"] = _rsi(close, 24)
+    data["rsi12_change_3d"] = data["RSI12"].diff(3) / 100
 
     returns = close.pct_change()
     for window in [5, 10, 20]:
         data[f"volatility_{window}d"] = returns.rolling(window).std()
+    data["volatility_ratio_5_20"] = data["volatility_5d"] / data["volatility_20d"]
     data["amplitude"] = (data["high"] - data["low"]) / close
     data["high_low_range"] = data["high"] / data["low"] - 1
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            data["high"] - data["low"],
+            (data["high"] - previous_close).abs(),
+            (data["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    data["atr_14"] = true_range.rolling(14).mean() / close
+    boll_mid = close.rolling(20).mean()
+    boll_std = close.rolling(20).std()
+    boll_upper = boll_mid + 2 * boll_std
+    boll_lower = boll_mid - 2 * boll_std
+    data["boll_width"] = (boll_upper - boll_lower) / boll_mid
+    data["boll_position"] = (close - boll_lower) / (boll_upper - boll_lower).replace(0, pd.NA)
 
     data["volume_ratio_5d"] = data["volume"] / data["volume"].rolling(5).mean()
     data["volume_ratio_20d"] = data["volume"] / data["volume"].rolling(20).mean()
+    volume_mean_20 = data["volume"].rolling(20).mean()
+    volume_std_20 = data["volume"].rolling(20).std().replace(0, pd.NA)
+    data["volume_zscore_20"] = (data["volume"] - volume_mean_20) / volume_std_20
     data["volume_up"] = ((data["close"] > data["open"]) & (data["volume_ratio_20d"] > 1.2)).astype(int)
     data["volume_down"] = ((data["close"] < data["open"]) & (data["volume_ratio_20d"] > 1.2)).astype(int)
     data["shrink_up"] = ((data["close"] > data["open"]) & (data["volume_ratio_20d"] < 0.8)).astype(int)
@@ -224,6 +257,17 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     data["consecutive_down_3d"] = down_days.rolling(3).sum()
     data["new_high_20d"] = (data["close"] >= data["close"].rolling(20).max()).astype(int)
     data["new_low_20d"] = (data["close"] <= data["close"].rolling(20).min()).astype(int)
+    rolling_high_20 = close.rolling(20).max()
+    rolling_low_20 = close.rolling(20).min()
+    data["distance_high_20d"] = close / rolling_high_20 - 1
+    data["distance_low_20d"] = close / rolling_low_20 - 1
+    data["drawdown_60d"] = close / close.rolling(60).max() - 1
+    absolute_move = close.diff().abs()
+    for window in [10, 20]:
+        path_length = absolute_move.rolling(window).sum().replace(0, pd.NA)
+        data[f"trend_efficiency_{window}d"] = close.diff(window).abs() / path_length
+    invalid_values = data[FEATURE_COLUMNS].isin([float("inf"), float("-inf")])
+    data[FEATURE_COLUMNS] = data[FEATURE_COLUMNS].mask(invalid_values)
     return data
 
 
@@ -471,27 +515,33 @@ def _normalize_probs(probs: dict) -> dict:
     return {label: clean[label] / total for label in LABELS}
 
 
-def _recent_label_probs(train_df: pd.DataFrame, label_col: str, window: int = 120) -> dict:
-    """计算近期标签分布，用于校准模型概率。"""
+def _recent_label_probs(train_df: pd.DataFrame, label_col: str, window: int = 160, half_life: int = 45) -> dict:
+    """按时间衰减计算近期标签分布，使概率更快适应市场状态变化。"""
     recent = train_df[label_col].dropna().tail(window)
     if recent.empty:
         return {label: 1 / 3 for label in LABELS}
-    counts = recent.value_counts(normalize=True)
-    smoothed = {label: float(counts.get(label, 0.0)) + 0.08 for label in LABELS}
+    ages = list(reversed(range(len(recent))))
+    weights = [0.5 ** (age / max(1, half_life)) for age in ages]
+    weighted_counts = {label: 0.0 for label in LABELS}
+    for label, weight in zip(recent.astype(str), weights):
+        if label in weighted_counts:
+            weighted_counts[label] += weight
+    smoothed = {label: weighted_counts[label] + 0.6 for label in LABELS}
     return _normalize_probs(smoothed)
 
 
 def _blend_probabilities(model_probs: dict, recent_probs: dict, rule_probs: dict, model_score: float | None) -> dict:
-    """融合模型概率、近期分布和规则概率，降低单模型过拟合影响。"""
+    """按样本外验证强弱动态融合模型、近期状态和技术规则。"""
     if model_score is None:
-        model_weight = 0.55
-    elif model_score >= 0.5:
-        model_weight = 0.68
-    elif model_score >= 0.42:
-        model_weight = 0.58
+        model_weight, recent_weight = 0.36, 0.44
+    elif model_score >= 0.48:
+        model_weight, recent_weight = 0.62, 0.24
+    elif model_score >= 0.40:
+        model_weight, recent_weight = 0.50, 0.32
+    elif model_score >= 0.36:
+        model_weight, recent_weight = 0.40, 0.40
     else:
-        model_weight = 0.45
-    recent_weight = 0.2
+        model_weight, recent_weight = 0.30, 0.50
     rule_weight = 1 - model_weight - recent_weight
     blended = {
         label: model_probs[label] * model_weight + recent_probs[label] * recent_weight + rule_probs[label] * rule_weight
@@ -501,66 +551,150 @@ def _blend_probabilities(model_probs: dict, recent_probs: dict, rule_probs: dict
 
 
 def _candidate_models() -> list[tuple[str, object]]:
-    """返回短线预测候选模型。"""
+    """返回适合中小样本、非线性量价关系的候选模型。"""
     return [
         (
             "RandomForestClassifier",
             RandomForestClassifier(
-                n_estimators=220,
+                n_estimators=90,
                 max_depth=6,
-                min_samples_leaf=6,
+                min_samples_leaf=8,
                 random_state=42,
                 class_weight="balanced_subsample",
+                n_jobs=-1,
             ),
         ),
         (
             "ExtraTreesClassifier",
             ExtraTreesClassifier(
-                n_estimators=240,
+                n_estimators=100,
                 max_depth=7,
-                min_samples_leaf=5,
+                min_samples_leaf=7,
                 random_state=42,
                 class_weight="balanced",
+                n_jobs=-1,
             ),
         ),
-        ("GradientBoostingClassifier", GradientBoostingClassifier(n_estimators=120, max_depth=2, learning_rate=0.04, random_state=42)),
-        ("LogisticRegression", make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced"))),
+        (
+            "LogisticRegression",
+            make_pipeline(
+                StandardScaler(),
+                LogisticRegression(max_iter=1200, C=0.35, class_weight="balanced"),
+            ),
+        ),
     ]
 
 
-def _time_series_score(model, x_train: pd.DataFrame, y_train: pd.Series) -> float | None:
-    """用时间序列切分评估候选模型，使用平衡准确率减少类别偏斜影响。"""
+def _aligned_probability_frame(model, x_data: pd.DataFrame) -> pd.DataFrame:
+    """把任意候选模型的概率列对齐到固定的三分类顺序。"""
+    raw = model.predict_proba(x_data)
+    aligned = pd.DataFrame(0.0, index=x_data.index, columns=LABELS)
+    for class_index, class_name in enumerate(model.classes_):
+        if str(class_name) in aligned.columns:
+            aligned[str(class_name)] = raw[:, class_index]
+    row_sum = aligned.sum(axis=1).replace(0, 1)
+    return aligned.div(row_sum, axis=0)
+
+
+def _time_series_score(model, x_train: pd.DataFrame, y_train: pd.Series, horizon: int) -> dict | None:
+    """用带隔离区的时间序列切分评估方向、概率质量和跨阶段稳定性。"""
     if len(x_train) < 260 or y_train.nunique() < 2:
         return None
-    splits = min(5, max(2, len(x_train) // 140))
-    scores = []
-    for train_idx, valid_idx in TimeSeriesSplit(n_splits=splits).split(x_train):
+    # 页面预测侧重快速反馈；两个带隔离区的滚动窗口覆盖较早与近期阶段，
+    # 避免每个预测周期重复进行多折 × 多模型的高成本训练。
+    splits = 2
+    balanced_scores = []
+    probability_losses = []
+    splitter = TimeSeriesSplit(n_splits=splits, gap=max(1, horizon), max_train_size=520)
+    for train_idx, valid_idx in splitter.split(x_train):
         x_tr, x_val = x_train.iloc[train_idx], x_train.iloc[valid_idx]
         y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[valid_idx]
         if y_tr.nunique() < 2:
             continue
-        model.fit(x_tr, y_tr)
-        pred = model.predict(x_val)
-        scores.append(balanced_accuracy_score(y_val, pred))
-    return float(sum(scores) / len(scores)) if scores else None
+        fold_model = clone(model)
+        fold_model.fit(x_tr, y_tr)
+        probabilities = _aligned_probability_frame(fold_model, x_val)
+        pred = probabilities.idxmax(axis=1)
+        balanced_scores.append(balanced_accuracy_score(y_val, pred))
+        ordered_labels = sorted(LABELS)
+        probability_losses.append(log_loss(y_val, probabilities[ordered_labels], labels=ordered_labels))
+    if not balanced_scores:
+        return None
+    balanced_mean = float(pd.Series(balanced_scores).mean())
+    balanced_std = float(pd.Series(balanced_scores).std(ddof=0))
+    loss_mean = float(pd.Series(probability_losses).mean())
+    probability_quality = max(0.0, 1 - loss_mean / log(len(LABELS)))
+    selection_score = 0.72 * balanced_mean + 0.28 * probability_quality - 0.12 * balanced_std
+    return {
+        "balanced_accuracy": balanced_mean,
+        "balanced_std": balanced_std,
+        "log_loss": loss_mean,
+        "selection_score": float(selection_score),
+    }
 
 
-def _extract_model_probs(model, latest_feature: pd.Series) -> dict:
-    """从训练好的模型中提取三分类概率。"""
-    proba = model.predict_proba(latest_feature[FEATURE_COLUMNS].to_frame().T)[0]
-    classes = list(model.classes_)
-    probs = {label: 0.0 for label in LABELS}
-    for cls, value in zip(classes, proba):
-        probs[cls] = float(value)
-    return _normalize_probs(probs)
+def _fit_model_ensemble(x_train: pd.DataFrame, y_train: pd.Series, horizon: int) -> dict | None:
+    """筛选并训练两个互补模型，降低单一模型在短样本上的波动。"""
+    evaluated = []
+    for model_name, model in _candidate_models():
+        metrics = _time_series_score(model, x_train, y_train, horizon)
+        if metrics is not None:
+            evaluated.append({"name": model_name, "model": model, "metrics": metrics})
+    if not evaluated:
+        return None
+    selected = sorted(evaluated, key=lambda item: item["metrics"]["selection_score"], reverse=True)[:2]
+    raw_weights = [max(0.03, item["metrics"]["selection_score"] - 0.28) for item in selected]
+    weight_total = sum(raw_weights)
+    fitted = []
+    for item, raw_weight in zip(selected, raw_weights):
+        fitted_model = clone(item["model"])
+        fitted_model.fit(x_train, y_train)
+        fitted.append(
+            {
+                "name": item["name"],
+                "model": fitted_model,
+                "weight": raw_weight / weight_total,
+                "metrics": item["metrics"],
+            }
+        )
+    weighted_accuracy = sum(item["weight"] * item["metrics"]["balanced_accuracy"] for item in fitted)
+    weighted_log_loss = sum(item["weight"] * item["metrics"]["log_loss"] for item in fitted)
+    return {
+        "models": fitted,
+        "cv_score": float(weighted_accuracy),
+        "cv_log_loss": float(weighted_log_loss),
+        "name": " + ".join(item["name"] for item in fitted),
+    }
+
+
+def _refit_model_ensemble(ensemble: dict, x_train: pd.DataFrame, y_train: pd.Series) -> dict:
+    """沿用最近一次验证选出的模型结构，仅用新增历史样本重新拟合。"""
+    candidates = dict(_candidate_models())
+    fitted = []
+    for item in ensemble["models"]:
+        model = clone(candidates[item["name"]])
+        model.fit(x_train, y_train)
+        fitted.append({**item, "model": model})
+    return {**ensemble, "models": fitted}
+
+
+def _extract_ensemble_probs(ensemble: dict, feature_row: pd.Series) -> dict:
+    """按验证质量权重融合已训练候选模型的三分类概率。"""
+    blended = {label: 0.0 for label in LABELS}
+    feature_frame = feature_row[FEATURE_COLUMNS].to_frame().T
+    for item in ensemble["models"]:
+        probabilities = _aligned_probability_frame(item["model"], feature_frame).iloc[0]
+        for label in LABELS:
+            blended[label] += float(probabilities[label]) * float(item["weight"])
+    return _normalize_probs(blended)
 
 
 def _confidence_from_probs(probs: dict, cv_score: float | None, low_reliability: bool) -> str:
     """根据概率分布和交叉验证结果判断置信度。"""
     max_prob = max(probs.values())
-    if low_reliability or max_prob < 0.43:
+    if low_reliability or max_prob < 0.45 or (cv_score is not None and cv_score < 0.36):
         return "低"
-    if max_prob >= 0.58 and (cv_score is None or cv_score >= 0.45):
+    if max_prob >= 0.58 and (cv_score is None or cv_score >= 0.46):
         return "高"
     return "中"
 
@@ -590,7 +724,7 @@ def _confidence_reason(probs: dict, cv_score: float | None, low_reliability: boo
         parts.append("历史验证偏弱")
 
     parts.append("历史数据不足" if low_reliability else "历史数据充足")
-    parts.append("已启用复盘校准" if "复盘校准" in model_name else "未启用复盘校准")
+    parts.append("已按近期市场状态收缩概率" if "时间隔离" in model_name else "使用规则概率")
     return "；".join(parts) + "。"
 
 
@@ -606,26 +740,14 @@ def _train_predict(data: pd.DataFrame, horizon: int, threshold: float, low_relia
     y_train = train_df[label_col]
     recent_probs = _recent_label_probs(train_df, label_col)
     rule_probs, strong_signals, _, weak_signals = _rule_probabilities(latest_feature, horizon)
-    models = _candidate_models()
     last_error = None
-    best = None
-    for model_name, model in models:
-        try:
-            cv_score = _time_series_score(model, x_train, y_train)
-            rank_score = cv_score if cv_score is not None else 0.0
-            if best is None or rank_score > best["score"]:
-                best = {"name": model_name, "model": model, "score": rank_score, "cv_score": cv_score}
-        except Exception as exc:
-            last_error = exc
-
-    if best is not None:
-        try:
-            model = best["model"]
-            model.fit(x_train, y_train)
-            raw_probs = _extract_model_probs(model, latest_feature)
-            probs = _blend_probabilities(raw_probs, recent_probs, rule_probs, best["cv_score"])
+    try:
+        ensemble = _fit_model_ensemble(x_train, y_train, horizon)
+        if ensemble is not None:
+            raw_probs = _extract_ensemble_probs(ensemble, latest_feature)
+            probs = _blend_probabilities(raw_probs, recent_probs, rule_probs, ensemble["cv_score"])
             direction = max(probs, key=probs.get)
-            model_label = f"{best['name']} + 概率校准"
+            model_label = f"时间隔离加权集成（{ensemble['name']}）"
             return {
                 "周期": f"{horizon}日",
                 "预测日期": pd.to_datetime(target_date).strftime("%Y-%m-%d") if target_date is not None else "",
@@ -633,16 +755,18 @@ def _train_predict(data: pd.DataFrame, horizon: int, threshold: float, low_relia
                 "上涨概率": probs["上涨"],
                 "震荡概率": probs["震荡"],
                 "下跌概率": probs["下跌"],
-                "置信度": _confidence_from_probs(probs, best["cv_score"], low_reliability),
-                "置信度说明": _confidence_reason(probs, best["cv_score"], low_reliability, model_label),
-                "预测依据": _build_prediction_reason(latest_feature, direction, best["cv_score"], best["name"]),
+                "置信度": _confidence_from_probs(probs, ensemble["cv_score"], low_reliability),
+                "置信度说明": _confidence_reason(probs, ensemble["cv_score"], low_reliability, model_label),
+                "预测依据": _build_prediction_reason(latest_feature, direction, ensemble["cv_score"], ensemble["name"]),
                 "主要支撑信号": strong_signals or _support_signals(latest_feature),
                 "主要风险信号": weak_signals or _risk_signals(latest_feature),
                 "风险提示": "历史数据不足，预测可靠性较低。" if low_reliability else "模型仅基于历史量价特征，无法覆盖突发消息和市场环境变化。",
                 "模型": model_label,
+                "验证平衡准确率": ensemble["cv_score"],
+                "验证对数损失": ensemble["cv_log_loss"],
             }
-        except Exception as exc:
-            last_error = exc
+    except Exception as exc:
+        last_error = exc
     result = _rule_prediction(latest_feature, horizon, low_reliability=True, target_date=target_date)
     result["风险提示"] += f" 机器学习模型训练失败，已使用规则模型。"
     result["模型错误"] = str(last_error)
@@ -712,12 +836,15 @@ def predict_short_term(
     )
     low_reliability = len(hist_df) < 250
     target_dates, calendar_source = next_trade_dates(hist_df.iloc[-1]["date"], 3)
-    predictions = []
     latest_feature = feature_df.dropna(subset=FEATURE_COLUMNS).iloc[-1]
-    current_thresholds = {}
-    for horizon in [1, 2, 3]:
-        horizon_threshold = float(latest_feature.get(f"label_threshold_{horizon}d", threshold))
-        current_thresholds[horizon] = horizon_threshold
+    horizons = [1, 2, 3]
+    current_thresholds = {
+        horizon: float(latest_feature.get(f"label_threshold_{horizon}d", threshold))
+        for horizon in horizons
+    }
+
+    def predict_horizon(horizon: int) -> dict:
+        horizon_threshold = current_thresholds[horizon]
         item = _train_predict(
             feature_df,
             horizon,
@@ -728,7 +855,9 @@ def predict_short_term(
         item["判断阈值"] = horizon_threshold
         item["阈值模式"] = "波动自适应" if normalized_mode == "adaptive" else "手动固定"
         item["标签版本"] = ADAPTIVE_THRESHOLD_VERSION if normalized_mode == "adaptive" else "fixed_v1"
-        predictions.append(_attach_range_estimate(item, feature_df, latest_feature, horizon, horizon_threshold))
+        return _attach_range_estimate(item, feature_df, latest_feature, horizon, horizon_threshold)
+
+    predictions = [predict_horizon(horizon) for horizon in horizons]
     similar_patterns = find_similar_patterns(feature_df, threshold=threshold, limit=8)
     return {
         "code": normalize_stock_code(stock_code),
@@ -744,7 +873,9 @@ def predict_short_term(
         "label_version": ADAPTIVE_THRESHOLD_VERSION if normalized_mode == "adaptive" else "fixed_v1",
         "current_thresholds": current_thresholds,
         "model_note": (
-            "使用前复权历史行情构造量价特征，分别训练 1、2、3 日分类模型；训练不使用未来数据。"
+            "使用前复权历史行情构造比例化趋势、波动率、量价和K线结构特征，分别训练 1、2、3 日分类模型。"
+            "候选模型通过带标签周期隔离区的时间序列验证，按平衡准确率、概率损失和跨阶段稳定性筛选，"
+            "再融合两个表现较稳的模型，并用近期市场状态对概率进行保守收缩；训练不使用未来数据。"
             + (
                 " 标签阈值按每个历史时点的近20日波动率和预测周期自动调整。"
                 if normalized_mode == "adaptive"

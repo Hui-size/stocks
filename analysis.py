@@ -8,21 +8,80 @@ def _format_percent(value: float | None) -> str:
     return f"{value:.2f}%"
 
 
-def judge_trend(df: pd.DataFrame) -> str:
-    """根据最近收盘价和 MA20 判断当前趋势。"""
-    latest = df.iloc[-1]
-    recent = df.tail(20)
-    close = latest["close"]
-    ma20 = latest.get("MA20")
-    if pd.isna(ma20):
-        return "震荡（样本不足，暂以中性处理）"
+def evaluate_trend_regime(df: pd.DataFrame) -> dict:
+    """综合价格、均线、波动率和趋势效率判断当前趋势状态。"""
+    if df is None or df.empty or len(df) < 20:
+        return {"趋势": "震荡", "趋势强度": 0, "趋势置信度": "低", "趋势依据": ["有效样本不足 20 个交易日"]}
 
-    recent_return = (recent.iloc[-1]["close"] - recent.iloc[0]["close"]) / recent.iloc[0]["close"] * 100
-    if close > ma20 and recent_return > 3:
-        return "上涨"
-    if close < ma20 and recent_return < -3:
-        return "下跌"
-    return "震荡"
+    latest = df.iloc[-1]
+    close = df["close"]
+    returns = close.pct_change()
+    daily_volatility = float(returns.tail(20).std()) if len(df) >= 20 else 0.0
+    score = 0.0
+    reasons = []
+
+    for window, weight in [(5, 0.7), (20, 1.2), (60, 0.8)]:
+        if len(df) <= window or daily_volatility <= 0:
+            continue
+        period_return = float(close.iloc[-1] / close.iloc[-window - 1] - 1)
+        normalized_move = period_return / (daily_volatility * (window**0.5))
+        contribution = max(-1.5, min(1.5, normalized_move)) * weight
+        score += contribution
+        if window in (20, 60) and abs(normalized_move) >= 0.55:
+            direction = "上涨" if period_return > 0 else "下跌"
+            reasons.append(f"近{window}日{direction} {abs(period_return):.2%}，相对波动率方向较明确")
+
+    ma5, ma10, ma20, ma60 = (latest.get(name) for name in ["MA5", "MA10", "MA20", "MA60"])
+    if all(pd.notna(value) for value in [ma5, ma10, ma20, ma60]):
+        if ma5 > ma10 > ma20 > ma60:
+            score += 1.5
+            reasons.append("MA5、MA10、MA20、MA60 呈多头排列")
+        elif ma5 < ma10 < ma20 < ma60:
+            score -= 1.5
+            reasons.append("MA5、MA10、MA20、MA60 呈空头排列")
+        elif latest["close"] > ma20:
+            score += 0.45
+        else:
+            score -= 0.45
+
+    if len(df) >= 25 and pd.notna(ma20) and pd.notna(df.iloc[-6].get("MA20")) and daily_volatility > 0:
+        ma20_slope = float(ma20 / df.iloc[-6]["MA20"] - 1)
+        slope_strength = ma20_slope / (daily_volatility * (5**0.5))
+        score += max(-1.0, min(1.0, slope_strength))
+        if abs(slope_strength) >= 0.45:
+            reasons.append("MA20 斜率向上" if slope_strength > 0 else "MA20 斜率向下")
+
+    path_length = float(close.diff().abs().tail(20).sum())
+    net_move = float(abs(close.iloc[-1] - close.iloc[-21])) if len(df) >= 21 else 0.0
+    trend_efficiency = net_move / path_length if path_length > 0 else 0.0
+    if trend_efficiency >= 0.35:
+        direction = 1 if close.iloc[-1] >= close.iloc[-21] else -1
+        score += direction * min(1.0, trend_efficiency * 1.5)
+        reasons.append(f"20日趋势效率 {trend_efficiency:.0%}，走势延续性较高")
+    elif trend_efficiency < 0.18:
+        score *= 0.82
+        reasons.append(f"20日趋势效率仅 {trend_efficiency:.0%}，往返震荡较多")
+
+    if score >= 2.4:
+        trend = "上涨"
+    elif score <= -2.4:
+        trend = "下跌"
+    else:
+        trend = "震荡"
+    strength = int(round(max(-100, min(100, score / 6 * 100))))
+    confidence = "高" if abs(score) >= 4 and trend_efficiency >= 0.30 else ("中" if abs(score) >= 2.4 else "低")
+    return {
+        "趋势": trend,
+        "趋势强度": strength,
+        "趋势置信度": confidence,
+        "趋势效率": trend_efficiency,
+        "趋势依据": reasons[:4] or ["多周期价格与均线信号相互抵消"],
+    }
+
+
+def judge_trend(df: pd.DataFrame) -> str:
+    """返回多周期、波动率归一化后的当前趋势。"""
+    return evaluate_trend_regime(df)["趋势"]
 
 
 def analyze_ma(df: pd.DataFrame) -> str:
@@ -404,7 +463,8 @@ def judge_forward_outlook(df: pd.DataFrame) -> dict:
 
 def build_analysis(df: pd.DataFrame, pct_chg: float | None = None) -> dict:
     """生成页面展示所需的结构化文字分析结论。"""
-    trend = judge_trend(df)
+    trend_profile = evaluate_trend_regime(df)
+    trend = trend_profile["趋势"]
     ma_text = analyze_ma(df)
     volume_text = analyze_volume(df)
     macd_text = analyze_macd(df)
@@ -418,6 +478,10 @@ def build_analysis(df: pd.DataFrame, pct_chg: float | None = None) -> dict:
 
     return {
         "趋势判断": trend,
+        "趋势强度": trend_profile["趋势强度"],
+        "趋势置信度": trend_profile["趋势置信度"],
+        "趋势效率": trend_profile.get("趋势效率"),
+        "趋势判断依据": "；".join(trend_profile["趋势依据"]),
         "涨跌幅": _format_percent(pct_chg),
         "均线状态": ma_text,
         "成交量变化": volume_text,
@@ -432,10 +496,10 @@ def build_analysis(df: pd.DataFrame, pct_chg: float | None = None) -> dict:
         "后市判断依据": forward_outlook["判断依据"],
         "积极信号": forward_outlook["积极信号"],
         "压力信号": forward_outlook["压力信号"],
-        "简短报告": f"当前趋势判断为{trend}，后市技术面倾向为{forward_outlook['后市倾向']}。{ma_text} {volume_text} {macd_text} {rsi_text} {boll_text} 风险方面，{risk_text}",
+        "简短报告": f"当前趋势判断为{trend}，趋势强度 {trend_profile['趋势强度']:+d}，置信度{trend_profile['趋势置信度']}；后市技术面倾向为{forward_outlook['后市倾向']}。{ma_text} {volume_text} {macd_text} {rsi_text} {boll_text} 风险方面，{risk_text}",
         "综合分析结论": {
             "趋势判断": trend,
-            "技术面信号": f"{ma_text} {macd_text} {rsi_text} {boll_text} 后市倾向：{forward_outlook['后市倾向']}，依据：{forward_outlook['判断依据']}。",
+            "技术面信号": f"趋势强度 {trend_profile['趋势强度']:+d}（置信度{trend_profile['趋势置信度']}），依据：{'；'.join(trend_profile['趋势依据'])}。{ma_text} {macd_text} {rsi_text} {boll_text} 后市倾向：{forward_outlook['后市倾向']}，依据：{forward_outlook['判断依据']}。",
             "风险点": risk_text,
             "免责声明": "仅供学习参考，不构成投资建议。",
         },

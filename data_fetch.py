@@ -3,6 +3,7 @@ from datetime import date, timedelta
 
 import akshare as ak
 import pandas as pd
+import requests
 
 
 class DataFetchError(Exception):
@@ -72,17 +73,28 @@ def _standardize_hist_data(raw_df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def fetch_hist_from_em(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """使用东方财富历史行情接口获取 A 股日 K 数据。"""
+def fetch_hist_from_tencent(stock_code: str, days: int) -> tuple[pd.DataFrame, str | None]:
+    """通过腾讯单股票接口获取日 K，避免无超时的全量行情请求。"""
     code = normalize_stock_code(stock_code)
-    raw_df = ak.stock_zh_a_hist(
-        symbol=code,
-        period="daily",
-        start_date=start_date,
-        end_date=end_date,
-        adjust="",
+    symbol = code_with_market_prefix(code)
+    response = requests.get(
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        params={"param": f"{symbol},day,,,{max(int(days), 30)},qfq"},
+        timeout=6,
     )
-    return _standardize_hist_data(raw_df)
+    response.raise_for_status()
+    payload = response.json().get("data", {}).get(symbol, {})
+    rows = payload.get("qfqday") or payload.get("day") or []
+    if not rows:
+        raise DataFetchError("腾讯单股票历史行情接口返回为空。")
+
+    raw_df = pd.DataFrame(
+        [row[:6] for row in rows],
+        columns=["date", "open", "close", "high", "low", "volume"],
+    )
+    quote_fields = payload.get("qt", {}).get(symbol) or []
+    name = quote_fields[1] if len(quote_fields) > 1 else None
+    return _standardize_hist_data(raw_df), name
 
 
 def fetch_hist_from_sina(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -116,16 +128,19 @@ def fetch_stock_history(stock_code: str, days: int = 365) -> tuple[pd.DataFrame,
 
     if time.monotonic() >= _EM_HIST_RETRY_AFTER:
         try:
-            return fetch_hist_from_em(stock_code, start_date, end_date), warnings
+            history, stock_name = fetch_hist_from_tencent(stock_code, days)
+            if stock_name:
+                history.attrs["stock_name"] = stock_name
+            return history, warnings
         except Exception as exc:
             _EM_HIST_RETRY_AFTER = time.monotonic() + _EM_HIST_COOLDOWN_SECONDS
-            errors.append(f"主接口 stock_zh_a_hist 获取失败：{exc}")
+            errors.append(f"主接口腾讯单股票日 K 获取失败：{exc}")
     else:
-        warnings.append("东方财富历史行情接口近期连接失败，本次已直接使用备用接口以提高加载速度。")
+        warnings.append("腾讯历史行情接口近期连接失败，本次已直接使用备用接口。")
 
     try:
         if not warnings:
-            warnings.append("东方财富历史行情接口当前连接不稳定，已自动切换到备用接口，历史行情数据已正常加载。")
+            warnings.append("腾讯历史行情接口当前连接不稳定，已自动切换到备用接口，历史行情数据已正常加载。")
         return fetch_hist_from_sina(stock_code, start_date, end_date), warnings
     except Exception as exc:
         errors.append(f"备用接口 stock_zh_a_daily 获取失败：{exc}")
@@ -146,42 +161,10 @@ def fetch_stock_basic_info(stock_code: str, hist_df: pd.DataFrame | None = None)
 
     info = {
         "code": code,
-        "name": code,
+        "name": str(hist_df.attrs.get("stock_name") or code) if hist_df is not None else code,
         "latest_price": fallback_close,
         "pct_chg": fallback_pct,
         "source": "历史收盘价",
     }
-
-    try:
-        individual_df = ak.stock_individual_info_em(symbol=code)
-        name_row = individual_df[individual_df["item"].astype(str) == "股票简称"]
-        if not name_row.empty:
-            info["name"] = str(name_row.iloc[0]["value"])
-    except Exception:
-        pass
-
-    try:
-        code_name_df = ak.stock_info_a_code_name()
-        row = code_name_df[code_name_df["code"].astype(str) == code]
-        if not row.empty:
-            info["name"] = str(row.iloc[0]["name"])
-    except Exception:
-        pass
-
-    try:
-        spot_df = ak.stock_zh_a_spot_em()
-        row = spot_df[spot_df["代码"].astype(str) == code]
-        if not row.empty:
-            item = row.iloc[0]
-            info.update(
-                {
-                    "name": str(item.get("名称", code)),
-                    "latest_price": pd.to_numeric(item.get("最新价"), errors="coerce"),
-                    "pct_chg": pd.to_numeric(item.get("涨跌幅"), errors="coerce"),
-                    "source": "实时行情",
-                }
-            )
-    except Exception:
-        pass
 
     return info
