@@ -2,6 +2,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from ai_interpreter import AIInterpreterError, generate_stock_interpretation
 from analysis import build_analysis, detect_anomaly_flags, estimate_support_resistance
@@ -29,36 +30,155 @@ from watchlist import add_to_watchlist, load_watchlist, remove_from_watchlist
 from backtest import build_backtest_figure, rolling_backtest
 
 
-def apply_custom_theme() -> None:
-    """注入页面样式，保持研究工作台的克制感和可读性。"""
-    st.markdown(
-        """
-<style>
-    :root {
-        --bg: #f5f6f7;
-        --panel: #ffffff;
-        --panel-soft: #f9fafb;
-        --text: #20242a;
-        --muted: #6b7280;
-        --line: #e3e6ea;
-        --line-strong: #d1d7df;
-        --accent: #475569;
-        --accent-soft: #e8edf2;
-        --warning: #9a3412;
+THEME_COOKIE_NAME = "short_term_research_theme"
+THEME_COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+
+
+def get_saved_theme() -> str:
+    """读取当前浏览器保存的主题偏好。"""
+    try:
+        saved_theme = st.context.cookies.get(THEME_COOKIE_NAME)
+    except Exception:
+        saved_theme = None
+    return "深色" if saved_theme == "dark" else "明亮"
+
+
+def persist_theme_preference(theme_mode: str) -> None:
+    """把主题偏好写入当前浏览器，有效期一年。"""
+    theme_value = "dark" if theme_mode == "深色" else "light"
+    components.html(
+        f"""
+        <script>
+        (() => {{
+            const preference = "{THEME_COOKIE_NAME}={theme_value}; Path=/; Max-Age={THEME_COOKIE_MAX_AGE}; SameSite=Lax";
+            try {{
+                window.parent.document.cookie = preference;
+            }} catch (error) {{
+                document.cookie = preference;
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def get_theme_palette(theme_mode: str | None = None) -> dict[str, str]:
+    """返回明亮或深色研究终端的统一颜色令牌。"""
+    if (theme_mode or st.session_state.get("ui_theme")) == "深色":
+        return {
+            "bg": "#080a0d",
+            "panel": "#101318",
+            "panel_soft": "#15191f",
+            "sidebar": "#0c0f13",
+            "text": "#f4f6f8",
+            "muted": "#a4abb5",
+            "line": "#242a32",
+            "line_strong": "#343c46",
+            "accent": "#d7dde5",
+            "accent_hover": "#ffffff",
+            "accent_soft": "#1b222b",
+            "input": "#11151a",
+            "button_text": "#101318",
+            "chart": "#0d1117",
+            "legend": "rgba(16,19,24,0.90)",
+            "grid": "#252c35",
+            "link": "#d8dee7",
+            "color_scheme": "dark",
+        }
+    return {
+        "bg": "#ffffff",
+        "panel": "#ffffff",
+        "panel_soft": "#f6f7f8",
+        "sidebar": "#f3f4f6",
+        "text": "#111318",
+        "muted": "#5f6670",
+        "line": "#e2e5e9",
+        "line_strong": "#cbd1d8",
+        "accent": "#334155",
+        "accent_hover": "#1f2937",
+        "accent_soft": "#e8edf2",
+        "input": "#ffffff",
+        "button_text": "#ffffff",
+        "chart": "#fbfcfd",
+        "legend": "rgba(255,255,255,0.90)",
+        "grid": "#e8ebef",
+        "link": "#334155",
+        "color_scheme": "light",
     }
 
+
+def apply_custom_theme(theme_mode: str | None = None) -> None:
+    """注入可切换主题，保持研究工作台的克制感和可读性。"""
+    palette = get_theme_palette(theme_mode)
+    css = """
+<style>
+    :root {
+        --bg: __BG__;
+        --panel: __PANEL__;
+        --panel-soft: __PANEL_SOFT__;
+        --sidebar: __SIDEBAR__;
+        --text: __TEXT__;
+        --muted: __MUTED__;
+        --line: __LINE__;
+        --line-strong: __LINE_STRONG__;
+        --accent: __ACCENT__;
+        --accent-hover: __ACCENT_HOVER__;
+        --accent-soft: __ACCENT_SOFT__;
+        --input: __INPUT__;
+        --button-text: __BUTTON_TEXT__;
+        --link: __LINK__;
+    }
+
+    html, body,
+    [data-testid="stAppViewContainer"],
     .stApp {
-        background: var(--bg);
-        color: var(--text);
+        background: var(--bg) !important;
+        color: var(--text) !important;
+    }
+
+    [data-testid="stHeader"] {
+        background: color-mix(in srgb, var(--bg) 92%, transparent) !important;
     }
 
     [data-testid="stSidebar"] {
-        background: #eef1f4;
+        background: var(--sidebar) !important;
         border-right: 1px solid var(--line-strong);
     }
 
-    [data-testid="stSidebar"] * {
-        color: #242a31 !important;
+    /* Keep the sidebar toggle visible on both light and dark themes. */
+    [data-testid="stSidebarCollapseButton"] button,
+    [data-testid="stSidebarCollapsedControl"] button,
+    [data-testid="stExpandSidebarButton"] {
+        color: var(--text) !important;
+    }
+
+    [data-testid="stExpandSidebarButton"] * {
+        color: var(--text) !important;
+    }
+
+    [data-testid="stSidebarCollapseButton"] button svg,
+    [data-testid="stSidebarCollapsedControl"] button svg,
+    [data-testid="stSidebarCollapseButton"] button svg path,
+    [data-testid="stSidebarCollapsedControl"] button svg path {
+        color: var(--text) !important;
+        fill: var(--text) !important;
+        stroke: var(--text) !important;
+    }
+
+    [data-testid="stSidebarCollapseButton"] button:hover,
+    [data-testid="stSidebarCollapsedControl"] button:hover,
+    [data-testid="stExpandSidebarButton"]:hover {
+        background: var(--accent-soft) !important;
+    }
+
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] div,
+    [data-testid="stSidebar"] summary {
+        color: var(--text) !important;
     }
 
     input[type="radio"],
@@ -68,16 +188,36 @@ def apply_custom_theme() -> None:
 
     [data-testid="stSidebar"] input,
     [data-testid="stSidebar"] textarea,
-    [data-testid="stSidebar"] select {
-        background: #ffffff !important;
+    [data-testid="stSidebar"] select,
+    [data-baseweb="input"] > div,
+    [data-baseweb="select"] > div,
+    [data-baseweb="textarea"] > div {
+        background: var(--input) !important;
         border: 1px solid var(--line-strong) !important;
-        color: #20242a !important;
+        color: var(--text) !important;
         border-radius: 6px !important;
         box-shadow: none !important;
     }
 
+    input, textarea, select {
+        color: var(--text) !important;
+        caret-color: var(--text) !important;
+    }
+
+    input::placeholder, textarea::placeholder {
+        color: var(--muted) !important;
+        opacity: 1;
+    }
+
+    [data-baseweb="popover"],
+    [data-baseweb="menu"],
+    [role="listbox"] {
+        background: var(--panel) !important;
+        color: var(--text) !important;
+    }
+
     [data-testid="stSidebar"] div[role="radiogroup"] label {
-        background: #f8fafc;
+        background: var(--panel-soft);
         border: 1px solid var(--line);
         border-radius: 6px;
         padding: 7px 9px;
@@ -89,7 +229,7 @@ def apply_custom_theme() -> None:
     [data-testid="stSidebar"] h3 {
         font-size: 1rem;
         font-weight: 700;
-        color: #111827 !important;
+        color: var(--text) !important;
     }
 
     .block-container {
@@ -98,8 +238,13 @@ def apply_custom_theme() -> None:
         padding-bottom: 2.4rem;
     }
 
+    h1, h2, h3, h4, h5, h6,
+    p, li, label,
+    [data-testid="stMarkdownContainer"] {
+        color: var(--text);
+    }
+
     h1 {
-        color: #20242a;
         font-weight: 760;
         letter-spacing: 0;
         padding-bottom: 0.1rem;
@@ -107,7 +252,6 @@ def apply_custom_theme() -> None:
     }
 
     h2, h3 {
-        color: #20242a;
         letter-spacing: 0;
         font-weight: 700;
     }
@@ -126,7 +270,7 @@ def apply_custom_theme() -> None:
     }
 
     .terminal-header strong {
-        color: #20242a;
+        color: var(--text);
         font-weight: 700;
     }
 
@@ -148,12 +292,12 @@ def apply_custom_theme() -> None:
     }
 
     [data-testid="stMetricLabel"] {
-        color: var(--muted);
+        color: var(--muted) !important;
         font-size: 0.82rem;
     }
 
     [data-testid="stMetricValue"] {
-        color: #20242a;
+        color: var(--text) !important;
         font-weight: 720;
         font-size: clamp(1.18rem, 1.8vw, 1.76rem);
         line-height: 1.15;
@@ -169,9 +313,20 @@ def apply_custom_theme() -> None:
         border-radius: 6px;
         padding: 8px;
         box-shadow: none;
+        color-scheme: __COLOR_SCHEME__;
+    }
+
+    [data-testid="stTable"] table,
+    [data-testid="stTable"] th,
+    [data-testid="stTable"] td {
+        background: var(--panel) !important;
+        color: var(--text) !important;
+        border-color: var(--line) !important;
     }
 
     .stAlert {
+        background: var(--panel-soft) !important;
+        color: var(--text) !important;
         border-radius: 6px;
         border: 1px solid var(--line-strong);
     }
@@ -183,28 +338,34 @@ def apply_custom_theme() -> None:
         box-shadow: none;
     }
 
+    div[data-testid="stExpander"] summary,
+    [data-testid="stStatusWidget"] {
+        color: var(--text) !important;
+        background: var(--panel) !important;
+    }
+
     .stButton > button,
     .stDownloadButton > button {
         border-radius: 6px;
         border: 1px solid var(--accent);
         background: var(--accent);
-        color: white;
+        color: var(--button-text);
         font-weight: 650;
         box-shadow: none;
     }
 
     .stButton > button:hover,
     .stDownloadButton > button:hover {
-        background: #334155;
-        border-color: #334155;
-        color: white;
+        background: var(--accent-hover);
+        border-color: var(--accent-hover);
+        color: var(--button-text);
     }
 
     .stButton > button *,
     .stDownloadButton > button *,
     [data-testid="stSidebar"] .stButton > button *,
     [data-testid="stSidebar"] .stDownloadButton > button * {
-        color: white !important;
+        color: var(--button-text) !important;
     }
 
     .stCaptionContainer,
@@ -213,27 +374,44 @@ def apply_custom_theme() -> None:
         color: var(--muted);
     }
 
+    a {
+        color: var(--link) !important;
+    }
+
+    code, pre {
+        background: var(--panel-soft) !important;
+        color: var(--text) !important;
+        border-color: var(--line) !important;
+    }
+
+    hr {
+        border-color: var(--line) !important;
+    }
+
     div[data-testid="stHorizontalBlock"] {
         gap: 0.8rem;
     }
 </style>
-""",
-        unsafe_allow_html=True,
-    )
+"""
+    for token, value in palette.items():
+        css = css.replace(f"__{token.upper()}__", value)
+    st.markdown(css, unsafe_allow_html=True)
 
 
 def style_plotly_figure(fig: go.Figure, height: int | None = None) -> go.Figure:
     """统一 Plotly 图表视觉风格。"""
+    palette = get_theme_palette()
+    dark_mode = st.session_state.get("ui_theme") == "深色"
     fig.update_layout(
-        template="plotly_white",
+        template="plotly_dark" if dark_mode else "plotly_white",
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#fbfcfd",
-        font=dict(color="#20242a", family="Arial"),
-        legend=dict(bgcolor="rgba(255,255,255,0.82)", bordercolor="#e3e6ea", borderwidth=1),
+        plot_bgcolor=palette["chart"],
+        font=dict(color=palette["text"], family="Arial"),
+        legend=dict(bgcolor=palette["legend"], bordercolor=palette["line"], borderwidth=1),
         margin=dict(l=20, r=20, t=38, b=20),
     )
-    fig.update_xaxes(showgrid=True, gridcolor="#edf0f2", zeroline=False)
-    fig.update_yaxes(showgrid=True, gridcolor="#edf0f2", zeroline=False)
+    fig.update_xaxes(showgrid=True, gridcolor=palette["grid"], zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor=palette["grid"], zeroline=False)
     if height:
         fig.update_layout(height=height)
     return fig
@@ -698,11 +876,27 @@ def update_run_status(status, label: str, state: str = "running", expanded: bool
         pass
 
 
+def clear_run_status(status) -> None:
+    """任务完成后移除临时状态面板，保持结果页面简洁。"""
+    try:
+        status.empty()
+    except Exception:
+        pass
+
+
 def render_sidebar() -> tuple[str, str, int, list[str], dict]:
     """渲染左侧边栏，并返回当前功能、选中代码、历史范围和自选股。"""
     app_config = load_config()
     with st.sidebar:
         st.header("短线研究助手")
+        selected_theme = st.radio(
+            "界面主题",
+            ["明亮", "深色"],
+            horizontal=True,
+            key="ui_theme",
+            help="明亮模式为白底黑字；深色模式为黑底白字。系统会在当前浏览器中记住你的选择。",
+        )
+        persist_theme_preference(selected_theme)
         default_code = st.session_state.get("selected_stock", "600519")
         selected_code = st.text_input("股票代码", value=default_code, placeholder="例如 600519、000001、300750")
         days = st.selectbox("分析周期", [30, 60, 120, 250], index=3)
@@ -1117,9 +1311,6 @@ def render_stock_detail(stock_code: str, days: int, show_export: bool = False, a
         st.error(f"{code} 数据获取失败：{exc}")
         return
 
-    for warning in dataset["warnings"]:
-        st.warning(warning)
-
     df = dataset["df"]
     info = dataset["info"]
     analysis_result = dataset["analysis"]
@@ -1191,7 +1382,7 @@ def render_stock_detail(stock_code: str, days: int, show_export: bool = False, a
         st.dataframe(build_recent_data_table(df), use_container_width=True, hide_index=True)
 
     render_analysis_report(analysis_result)
-    update_run_status(run_status, "页面加载完成。", state="complete", expanded=False)
+    clear_run_status(run_status)
 
 
 def render_short_term_prediction(
@@ -1450,7 +1641,7 @@ def render_short_term_prediction(
     st.subheader("模型说明")
     st.info(result["model_note"])
     st.caption("免责声明：模型输出仅用于学习和研究，不代表未来一定上涨或下跌，不构成任何投资建议。")
-    update_run_status(run_status, "页面加载完成。", state="complete", expanded=False)
+    clear_run_status(run_status)
 
 
 def render_batch_prediction_collector(
@@ -1673,13 +1864,15 @@ def render_model_backtest(
 
     st.info(result["note"])
     st.caption("回测结果只说明历史表现，不代表未来一定准确。")
-    update_run_status(run_status, "页面加载完成。", state="complete", expanded=False)
+    clear_run_status(run_status)
 
 
 def main():
     """Streamlit 应用入口，负责看板导航和页面分发。"""
     st.set_page_config(page_title="A股短线研究助手", layout="wide")
-    apply_custom_theme()
+    if "ui_theme" not in st.session_state:
+        st.session_state["ui_theme"] = get_saved_theme()
+    apply_custom_theme(st.session_state["ui_theme"])
     st.title("短线研究工作台")
     st.markdown(
         """
