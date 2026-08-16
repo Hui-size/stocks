@@ -1,7 +1,14 @@
 import pandas as pd
 import plotly.graph_objects as go
 
-from prediction import FEATURE_COLUMNS, LABELS, add_prediction_labels, build_features, fetch_prediction_history
+from prediction import (
+    ADAPTIVE_THRESHOLD_VERSION,
+    FEATURE_COLUMNS,
+    LABELS,
+    add_prediction_labels,
+    build_features,
+    fetch_prediction_history,
+)
 from sklearn.ensemble import RandomForestClassifier
 
 
@@ -12,32 +19,116 @@ def _safe_accuracy(df: pd.DataFrame) -> float | None:
     return float((df["actual"] == df["predicted"]).mean())
 
 
-def _fit_predict_window(train_df: pd.DataFrame, test_row: pd.Series, label_col: str) -> str:
-    """用历史窗口训练模型并预测单个测试样本。"""
-    train_df = train_df.dropna(subset=FEATURE_COLUMNS + [label_col])
-    if len(train_df) < 160 or train_df[label_col].nunique() < 2:
-        return "震荡"
-    model = RandomForestClassifier(n_estimators=40, max_depth=5, min_samples_leaf=8, random_state=42, class_weight="balanced")
-    model.fit(train_df[FEATURE_COLUMNS], train_df[label_col])
-    return str(model.predict(test_row[FEATURE_COLUMNS].to_frame().T)[0])
+def _fit_predict_window(
+    train_df: pd.DataFrame,
+    test_row: pd.Series,
+    label_col: str,
+    fitted_model=None,
+) -> tuple[dict, object | None]:
+    """按需训练历史窗口模型，并返回单个样本的方向、概率和可复用模型。"""
+    if fitted_model is None:
+        train_df = train_df.dropna(subset=FEATURE_COLUMNS + [label_col])
+    if fitted_model is None and (len(train_df) < 160 or train_df[label_col].nunique() < 2):
+        return {
+            "predicted": "震荡",
+            "up_prob": 0.2,
+            "flat_prob": 0.6,
+            "down_prob": 0.2,
+            "confidence": "低",
+            "model": "历史回放规则回退",
+        }, None
+    model = fitted_model
+    if model is None:
+        model = RandomForestClassifier(
+            n_estimators=40,
+            max_depth=5,
+            min_samples_leaf=8,
+            random_state=42,
+            class_weight="balanced",
+            n_jobs=-1,
+        )
+        model.fit(train_df[FEATURE_COLUMNS], train_df[label_col])
+    probabilities = {label: 0.0 for label in LABELS}
+    for label, value in zip(model.classes_, model.predict_proba(test_row[FEATURE_COLUMNS].to_frame().T)[0]):
+        probabilities[str(label)] = float(value)
+    predicted = max(probabilities, key=probabilities.get)
+    top_probability = probabilities[predicted]
+    confidence = "高" if top_probability >= 0.58 else ("中" if top_probability >= 0.43 else "低")
+    return {
+        "predicted": predicted,
+        "up_prob": probabilities["上涨"],
+        "flat_prob": probabilities["震荡"],
+        "down_prob": probabilities["下跌"],
+        "confidence": confidence,
+        "model": "历史滚动随机森林",
+    }, model
 
 
-def rolling_backtest(stock_code: str, threshold: float = 0.01, test_days: int = 120, train_window: int = 500) -> dict:
+def rolling_backtest(
+    stock_code: str,
+    threshold: float = 0.01,
+    test_days: int = 120,
+    train_window: int = 500,
+    retrain_interval: int = 20,
+    threshold_mode: str = "manual",
+) -> dict:
     """使用历史滚动方式回测 1、2、3 日预测效果，避免数据泄漏。"""
     hist_df = fetch_prediction_history(stock_code)
-    data = add_prediction_labels(build_features(hist_df), threshold=threshold).dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
+    normalized_mode = "adaptive" if threshold_mode == "adaptive" else "manual"
+    feature_df = add_prediction_labels(
+        build_features(hist_df),
+        threshold=threshold,
+        threshold_mode=normalized_mode,
+    )
+    for horizon in [1, 2, 3]:
+        feature_df[f"target_date_{horizon}d"] = feature_df["date"].shift(-horizon)
+    data = feature_df.dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
     results = {}
     for horizon in [1, 2, 3]:
         label_col = f"label_{horizon}d"
-        usable = data.dropna(subset=[label_col]).reset_index(drop=True)
+        target_date_col = f"target_date_{horizon}d"
+        return_col = f"future_return_{horizon}d"
+        usable = data.dropna(subset=[label_col, target_date_col, return_col]).reset_index(drop=True)
         rows = []
-        start = max(train_window, len(usable) - test_days)
+        minimum_history = 160 + horizon - 1
+        start = max(minimum_history, len(usable) - test_days)
+        fitted_model = None
+        model_train_samples = 0
         for idx in range(start, len(usable)):
-            train_start = max(0, idx - train_window)
-            train_df = usable.iloc[train_start:idx]
+            # 在测试日只能使用目标结果已经发生的训练标签。
+            train_end = idx - horizon + 1
+            train_start = max(0, train_end - train_window)
+            train_df = usable.iloc[train_start:train_end]
             test_row = usable.iloc[idx]
-            predicted = _fit_predict_window(train_df, test_row, label_col)
-            rows.append({"date": test_row["date"], "predicted": predicted, "actual": test_row[label_col], "horizon": horizon})
+            should_retrain = fitted_model is None or (idx - start) % max(1, retrain_interval) == 0
+            if should_retrain:
+                fitted_model = None
+                model_train_samples = len(train_df)
+            prediction, fitted_model = _fit_predict_window(
+                train_df,
+                test_row,
+                label_col,
+                fitted_model=fitted_model,
+            )
+            rows.append(
+                {
+                    "date": test_row["date"],
+                    "target_date": test_row[target_date_col],
+                    "predicted": prediction["predicted"],
+                    "actual": str(test_row[label_col]),
+                    "actual_return": float(test_row[return_col]),
+                    "horizon": horizon,
+                    "up_prob": prediction["up_prob"],
+                    "flat_prob": prediction["flat_prob"],
+                    "down_prob": prediction["down_prob"],
+                    "confidence": prediction["confidence"],
+                    "model": prediction["model"],
+                    "train_samples": model_train_samples,
+                    "label_threshold": float(test_row.get(f"label_threshold_{horizon}d", threshold)),
+                    "threshold_mode": normalized_mode,
+                    "label_version": ADAPTIVE_THRESHOLD_VERSION if normalized_mode == "adaptive" else "fixed_v1",
+                }
+            )
         result_df = pd.DataFrame(rows)
         results[horizon] = result_df
 
@@ -53,7 +144,13 @@ def rolling_backtest(stock_code: str, threshold: float = 0.01, test_days: int = 
         "accuracy_by_horizon": accuracy_by_horizon,
         "confusion_matrix": confusion,
         "results": combined,
-        "note": "回测使用滚动训练方式，每个测试点只使用其之前的数据训练，历史表现不代表未来一定准确。",
+        "threshold_mode": normalized_mode,
+        "label_version": ADAPTIVE_THRESHOLD_VERSION if normalized_mode == "adaptive" else "fixed_v1",
+        "note": (
+            "回测使用滚动训练方式，每个测试点只使用当时已经发生并可获得结果的历史标签训练，"
+            f"2-3 日标签也会等待对应周期结束后才进入训练；模型每 {max(1, retrain_interval)} 个交易日重新训练一次以控制耗时。"
+            "历史表现不代表未来一定准确。"
+        ),
     }
 
 

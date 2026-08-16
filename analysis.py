@@ -136,6 +136,163 @@ def build_risk_flags(df: pd.DataFrame) -> list[str]:
         risks.append("当前技术指标未触发明显极端风险，但仍需关注市场、行业和公司公告变化。")
     return risks
 
+
+def detect_anomaly_flags(df: pd.DataFrame) -> list[dict]:
+    """检测短线异常波动，只提示客观现象，不给交易建议。"""
+    if df is None or df.empty or len(df) < 8:
+        return []
+
+    data = df.copy()
+    latest = data.iloc[-1]
+    previous = data.iloc[-2] if len(data) >= 2 else latest
+    flags = []
+
+    returns = data["close"].pct_change()
+    latest_return = float(returns.iloc[-1]) if pd.notna(returns.iloc[-1]) else 0.0
+    avg_abs_return = float(returns.abs().tail(20).mean()) if len(data) >= 20 else float(returns.abs().mean())
+    if avg_abs_return > 0 and abs(latest_return) >= max(avg_abs_return * 1.8, 0.025):
+        flags.append(
+            {
+                "类型": "价格波动放大",
+                "级别": "关注",
+                "说明": f"今日涨跌幅 {latest_return:.2%}，明显高于近期平均绝对波动 {avg_abs_return:.2%}。",
+            }
+        )
+
+    latest_volume = latest.get("volume")
+    avg_volume = data["volume"].tail(20).mean()
+    if pd.notna(latest_volume) and pd.notna(avg_volume) and avg_volume > 0:
+        volume_ratio = float(latest_volume / avg_volume)
+        if volume_ratio >= 2.0:
+            flags.append(
+                {
+                    "类型": "成交量突然放大",
+                    "级别": "关注",
+                    "说明": f"今日成交量约为 20 日均量的 {volume_ratio:.2f} 倍，量能明显异常。",
+                }
+            )
+
+    for ma_name in ["MA20", "MA60"]:
+        ma_value = latest.get(ma_name)
+        prev_ma_value = previous.get(ma_name)
+        if all(pd.notna(x) for x in [ma_value, prev_ma_value, latest.get("close"), previous.get("close")]):
+            if previous["close"] >= prev_ma_value and latest["close"] < ma_value:
+                flags.append(
+                    {
+                        "类型": f"跌破{ma_name}",
+                        "级别": "风险",
+                        "说明": f"收盘价由 {ma_name} 上方转到下方，短线趋势可能转弱。",
+                    }
+                )
+
+    recent3 = data.tail(3).copy()
+    if len(recent3) == 3:
+        day_returns = recent3["close"].pct_change()
+        candle_returns = recent3["close"] / recent3["open"] - 1
+        big_up = (candle_returns > 0.025).all() and (day_returns.iloc[1:] > 0).all()
+        big_down = (candle_returns < -0.025).all() and (day_returns.iloc[1:] < 0).all()
+        if big_up:
+            flags.append(
+                {
+                    "类型": "连续 3 天大阳线",
+                    "级别": "关注",
+                    "说明": "最近 3 个交易日均为较强阳线，短线波动和分歧可能加大。",
+                }
+            )
+        if big_down:
+            flags.append(
+                {
+                    "类型": "连续 3 天大阴线",
+                    "级别": "风险",
+                    "说明": "最近 3 个交易日均为较弱阴线，短线承压迹象较明显。",
+                }
+            )
+
+    return flags
+
+
+def _nearest_level(levels: list[float], current_price: float, side: str) -> float | None:
+    """从候选价位里取最接近当前价的上方或下方位置。"""
+    clean = sorted({round(float(level), 2) for level in levels if pd.notna(level) and level > 0})
+    if side == "support":
+        candidates = [level for level in clean if level <= current_price]
+        return max(candidates) if candidates else (min(clean) if clean else None)
+    candidates = [level for level in clean if level >= current_price]
+    return min(candidates) if candidates else (max(clean) if clean else None)
+
+
+def _volume_dense_levels(df: pd.DataFrame, bins: int = 12) -> list[float]:
+    """用收盘价区间和成交量估算成交密集价位。"""
+    data = df.dropna(subset=["close", "volume"]).copy()
+    if len(data) < 10:
+        return []
+    low = float(data["close"].min())
+    high = float(data["close"].max())
+    if high <= low:
+        return [round(float(data["close"].iloc[-1]), 2)]
+
+    bucket_count = min(bins, max(5, len(data) // 4))
+    bucket_width = (high - low) / bucket_count
+    if bucket_width <= 0:
+        return []
+    bucket_index = ((data["close"] - low) / bucket_width).clip(0, bucket_count - 1).astype(int)
+    volume_by_bucket = data.groupby(bucket_index)["volume"].sum().sort_values(ascending=False)
+    dense_levels = []
+    for bucket in volume_by_bucket.head(3).index:
+        center = low + (int(bucket) + 0.5) * bucket_width
+        dense_levels.append(round(center, 2))
+    return dense_levels
+
+
+def estimate_support_resistance(df: pd.DataFrame) -> dict:
+    """根据近20/60日高低点和成交密集区估算短线支撑位、压力位。"""
+    if df is None or df.empty or len(df) < 20:
+        return {}
+
+    data = df.copy()
+    latest = data.iloc[-1]
+    current_price = float(latest["close"])
+    recent20 = data.tail(20)
+    recent60 = data.tail(min(60, len(data)))
+
+    dense_levels = _volume_dense_levels(recent60)
+    supports = [
+        float(recent20["low"].min()),
+        float(recent60["low"].min()),
+        *[level for level in dense_levels if level <= current_price],
+    ]
+    resistances = [
+        float(recent20["high"].max()),
+        float(recent60["high"].max()),
+        *[level for level in dense_levels if level >= current_price],
+    ]
+
+    support = _nearest_level(supports, current_price, "support")
+    resistance = _nearest_level(resistances, current_price, "resistance")
+    support_gap = None if support is None else (current_price / support - 1)
+    resistance_gap = None if resistance is None else (resistance / current_price - 1)
+
+    explanation = (
+        f"近20日低点 {recent20['low'].min():.2f}、近60日低点 {recent60['low'].min():.2f} "
+        f"作为支撑候选；近20日高点 {recent20['high'].max():.2f}、近60日高点 {recent60['high'].max():.2f} "
+        "作为压力候选。成交密集区由最近60日收盘价区间按成交量粗略分箱估算。"
+    )
+
+    return {
+        "current_price": current_price,
+        "support": support,
+        "resistance": resistance,
+        "support_gap": support_gap,
+        "resistance_gap": resistance_gap,
+        "dense_levels": dense_levels,
+        "near_20_low": float(recent20["low"].min()),
+        "near_20_high": float(recent20["high"].max()),
+        "near_60_low": float(recent60["low"].min()),
+        "near_60_high": float(recent60["high"].max()),
+        "explanation": explanation,
+    }
+
+
 def analyze_risk(df: pd.DataFrame) -> str:
     """结合波动率和布林线位置生成风险提示。"""
     latest = df.iloc[-1]

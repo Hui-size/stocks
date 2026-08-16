@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from math import sqrt
 
 import akshare as ak
 import pandas as pd
@@ -13,6 +14,10 @@ from data_fetch import DataFetchError, normalize_stock_code
 
 
 LABELS = ["上涨", "震荡", "下跌"]
+ADAPTIVE_THRESHOLD_VERSION = "volatility_20d_v1"
+ADAPTIVE_THRESHOLD_MIN = 0.006
+ADAPTIVE_THRESHOLD_MAX = 0.04
+ADAPTIVE_THRESHOLD_FACTOR = 0.80
 FEATURE_COLUMNS = [
     "ret_1d",
     "ret_3d",
@@ -222,13 +227,41 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def add_prediction_labels(df: pd.DataFrame, threshold: float = 0.01) -> pd.DataFrame:
-    """构造未来 1、2、3 日分类标签。"""
+def _label_threshold_series(
+    data: pd.DataFrame,
+    horizon: int,
+    threshold: float,
+    threshold_mode: str,
+) -> pd.Series:
+    """生成每个历史时点可用的标签阈值，不使用未来数据。"""
+    fallback = max(ADAPTIVE_THRESHOLD_MIN, min(ADAPTIVE_THRESHOLD_MAX, float(threshold)))
+    if threshold_mode != "adaptive":
+        return pd.Series(float(threshold), index=data.index, dtype="float64")
+
+    if "volatility_20d" in data.columns:
+        daily_volatility = pd.to_numeric(data["volatility_20d"], errors="coerce")
+    else:
+        daily_volatility = pd.to_numeric(data["close"], errors="coerce").pct_change().rolling(20).std()
+    adaptive = daily_volatility * sqrt(horizon) * ADAPTIVE_THRESHOLD_FACTOR
+    return adaptive.clip(ADAPTIVE_THRESHOLD_MIN, ADAPTIVE_THRESHOLD_MAX).fillna(fallback)
+
+
+def add_prediction_labels(
+    df: pd.DataFrame,
+    threshold: float = 0.01,
+    threshold_mode: str = "manual",
+) -> pd.DataFrame:
+    """构造未来 1、2、3 日分类标签，支持按当时波动率自适应。"""
     data = df.copy()
     for horizon in [1, 2, 3]:
         future_return = data["close"].shift(-horizon) / data["close"] - 1
+        label_threshold = _label_threshold_series(data, horizon, threshold, threshold_mode)
         data[f"future_return_{horizon}d"] = future_return
-        data[f"label_{horizon}d"] = future_return.apply(lambda x: "上涨" if x > threshold else ("下跌" if x < -threshold else "震荡"))
+        data[f"label_threshold_{horizon}d"] = label_threshold
+        labels = pd.Series("震荡", index=data.index, dtype="object")
+        labels.loc[future_return > label_threshold] = "上涨"
+        labels.loc[future_return < -label_threshold] = "下跌"
+        data[f"label_{horizon}d"] = labels
         data.loc[future_return.isna(), f"label_{horizon}d"] = pd.NA
     return data
 
@@ -305,11 +338,62 @@ def _attach_range_estimate(result: dict, data: pd.DataFrame, latest_feature: pd.
     return result
 
 
+def _label_from_threshold(value: float, threshold: float) -> str:
+    """根据阈值把收益率转换为上涨、震荡、下跌。"""
+    if value > threshold:
+        return "上涨"
+    if value < -threshold:
+        return "下跌"
+    return "震荡"
+
+
+def find_similar_patterns(data: pd.DataFrame, threshold: float, limit: int = 8) -> list[dict]:
+    """查找历史上与当前技术特征相似的样本，并给出随后 1-3 日实际走势。"""
+    usable = data.dropna(subset=FEATURE_COLUMNS + ["date", "close"]).copy()
+    if len(usable) < 90:
+        return []
+
+    latest = usable.iloc[-1]
+    history = usable.iloc[:-3].copy()
+    if history.empty:
+        return []
+
+    feature_median = history[FEATURE_COLUMNS].median(numeric_only=True)
+    feature_std = history[FEATURE_COLUMNS].std(numeric_only=True).replace(0, 1)
+    latest_vector = ((latest[FEATURE_COLUMNS] - feature_median) / feature_std).astype(float)
+    history_vectors = ((history[FEATURE_COLUMNS] - feature_median) / feature_std).astype(float)
+    distances = ((history_vectors - latest_vector) ** 2).mean(axis=1) ** 0.5
+
+    candidates = history.assign(_distance=distances).dropna(subset=["_distance"]).nsmallest(limit, "_distance")
+    rows = []
+    for idx, row in candidates.iterrows():
+        item = {
+            "日期": pd.to_datetime(row["date"]).strftime("%Y-%m-%d"),
+            "相似度": max(0.0, min(1.0, 1 / (1 + float(row["_distance"])))),
+            "当日收盘": float(row["close"]),
+        }
+        for horizon in [1, 2, 3]:
+            future_idx = idx + horizon
+            if future_idx >= len(data) or pd.isna(data.iloc[future_idx].get("close")):
+                continue
+            future_return = float(data.iloc[future_idx]["close"] / row["close"] - 1)
+            item[f"{horizon}日后涨跌幅"] = future_return
+            historical_label = row.get(f"label_{horizon}d")
+            item[f"{horizon}日后走势"] = (
+                str(historical_label)
+                if pd.notna(historical_label)
+                else _label_from_threshold(future_return, threshold)
+            )
+        rows.append(item)
+    return rows
+
+
 def _rule_prediction(feature_row: pd.Series, horizon: int, low_reliability: bool = False, target_date=None) -> dict:
     """使用规则模型生成备用预测。"""
     probs, strong, neutral, weak = _rule_probabilities(feature_row, horizon)
     direction = max(probs, key=probs.get)
     confidence = "低" if low_reliability or max(probs.values()) < 0.45 else "中"
+    model_label = "规则模型"
     return {
         "周期": f"{horizon}日",
         "预测日期": pd.to_datetime(target_date).strftime("%Y-%m-%d") if target_date is not None else "",
@@ -318,11 +402,12 @@ def _rule_prediction(feature_row: pd.Series, horizon: int, low_reliability: bool
         "震荡概率": probs["震荡"],
         "下跌概率": probs["下跌"],
         "置信度": confidence,
+        "置信度说明": _confidence_reason(probs, None, low_reliability, model_label),
         "预测依据": "；".join((strong + neutral + weak)[:6]) or "指标信号不充分，按规则模型中性处理。",
         "主要支撑信号": strong,
         "主要风险信号": weak,
         "风险提示": "历史数据不足，预测可靠性较低。" if low_reliability else "短线预测受市场情绪、消息面和流动性影响较大。",
-        "模型": "规则模型",
+        "模型": model_label,
     }
 
 
@@ -480,6 +565,35 @@ def _confidence_from_probs(probs: dict, cv_score: float | None, low_reliability:
     return "中"
 
 
+def _confidence_reason(probs: dict, cv_score: float | None, low_reliability: bool, model_name: str) -> str:
+    """用简短中文解释置信度来源，避免用户只看到低/中/高。"""
+    sorted_probs = sorted(probs.items(), key=lambda item: item[1], reverse=True)
+    top_label, top_prob = sorted_probs[0]
+    second_prob = sorted_probs[1][1] if len(sorted_probs) > 1 else 0
+    gap = top_prob - second_prob
+
+    parts = []
+    if gap >= 0.18:
+        parts.append(f"{top_label}概率领先较明显")
+    elif gap >= 0.08:
+        parts.append(f"{top_label}概率略占优")
+    else:
+        parts.append("三类概率接近")
+
+    if cv_score is None:
+        parts.append("历史验证样本偏少")
+    elif cv_score >= 0.50:
+        parts.append("历史验证表现尚可")
+    elif cv_score >= 0.42:
+        parts.append("历史验证一般")
+    else:
+        parts.append("历史验证偏弱")
+
+    parts.append("历史数据不足" if low_reliability else "历史数据充足")
+    parts.append("已启用复盘校准" if "复盘校准" in model_name else "未启用复盘校准")
+    return "；".join(parts) + "。"
+
+
 def _train_predict(data: pd.DataFrame, horizon: int, threshold: float, low_reliability: bool, target_date=None) -> dict:
     """训练指定周期模型并预测最新一日的未来走势。"""
     label_col = f"label_{horizon}d"
@@ -511,6 +625,7 @@ def _train_predict(data: pd.DataFrame, horizon: int, threshold: float, low_relia
             raw_probs = _extract_model_probs(model, latest_feature)
             probs = _blend_probabilities(raw_probs, recent_probs, rule_probs, best["cv_score"])
             direction = max(probs, key=probs.get)
+            model_label = f"{best['name']} + 概率校准"
             return {
                 "周期": f"{horizon}日",
                 "预测日期": pd.to_datetime(target_date).strftime("%Y-%m-%d") if target_date is not None else "",
@@ -519,11 +634,12 @@ def _train_predict(data: pd.DataFrame, horizon: int, threshold: float, low_relia
                 "震荡概率": probs["震荡"],
                 "下跌概率": probs["下跌"],
                 "置信度": _confidence_from_probs(probs, best["cv_score"], low_reliability),
+                "置信度说明": _confidence_reason(probs, best["cv_score"], low_reliability, model_label),
                 "预测依据": _build_prediction_reason(latest_feature, direction, best["cv_score"], best["name"]),
                 "主要支撑信号": strong_signals or _support_signals(latest_feature),
                 "主要风险信号": weak_signals or _risk_signals(latest_feature),
                 "风险提示": "历史数据不足，预测可靠性较低。" if low_reliability else "模型仅基于历史量价特征，无法覆盖突发消息和市场环境变化。",
-                "模型": f"{best['name']} + 概率校准",
+                "模型": model_label,
             }
         except Exception as exc:
             last_error = exc
@@ -581,17 +697,39 @@ def _build_prediction_reason(row: pd.Series, direction: str, cv_score: float | N
     return "；".join(parts)
 
 
-def predict_short_term(stock_code: str, threshold: float = 0.01) -> dict:
+def predict_short_term(
+    stock_code: str,
+    threshold: float = 0.01,
+    threshold_mode: str = "manual",
+) -> dict:
     """输出未来 1-3 个交易日短线走势预测。"""
     hist_df = fetch_prediction_history(stock_code)
-    feature_df = add_prediction_labels(build_features(hist_df), threshold=threshold)
+    normalized_mode = "adaptive" if threshold_mode == "adaptive" else "manual"
+    feature_df = add_prediction_labels(
+        build_features(hist_df),
+        threshold=threshold,
+        threshold_mode=normalized_mode,
+    )
     low_reliability = len(hist_df) < 250
     target_dates, calendar_source = next_trade_dates(hist_df.iloc[-1]["date"], 3)
     predictions = []
     latest_feature = feature_df.dropna(subset=FEATURE_COLUMNS).iloc[-1]
+    current_thresholds = {}
     for horizon in [1, 2, 3]:
-        item = _train_predict(feature_df, horizon, threshold, low_reliability, target_date=target_dates[horizon - 1])
-        predictions.append(_attach_range_estimate(item, feature_df, latest_feature, horizon, threshold))
+        horizon_threshold = float(latest_feature.get(f"label_threshold_{horizon}d", threshold))
+        current_thresholds[horizon] = horizon_threshold
+        item = _train_predict(
+            feature_df,
+            horizon,
+            horizon_threshold,
+            low_reliability,
+            target_date=target_dates[horizon - 1],
+        )
+        item["判断阈值"] = horizon_threshold
+        item["阈值模式"] = "波动自适应" if normalized_mode == "adaptive" else "手动固定"
+        item["标签版本"] = ADAPTIVE_THRESHOLD_VERSION if normalized_mode == "adaptive" else "fixed_v1"
+        predictions.append(_attach_range_estimate(item, feature_df, latest_feature, horizon, horizon_threshold))
+    similar_patterns = find_similar_patterns(feature_df, threshold=threshold, limit=8)
     return {
         "code": normalize_stock_code(stock_code),
         "rows": len(hist_df),
@@ -601,5 +739,16 @@ def predict_short_term(stock_code: str, threshold: float = 0.01) -> dict:
         "low_reliability": low_reliability,
         "data": feature_df,
         "predictions": predictions,
-        "model_note": "使用前复权历史行情构造量价特征，分别训练 1、2、3 日分类模型；训练不使用未来数据。",
+        "similar_patterns": similar_patterns,
+        "threshold_mode": normalized_mode,
+        "label_version": ADAPTIVE_THRESHOLD_VERSION if normalized_mode == "adaptive" else "fixed_v1",
+        "current_thresholds": current_thresholds,
+        "model_note": (
+            "使用前复权历史行情构造量价特征，分别训练 1、2、3 日分类模型；训练不使用未来数据。"
+            + (
+                " 标签阈值按每个历史时点的近20日波动率和预测周期自动调整。"
+                if normalized_mode == "adaptive"
+                else f" 标签使用固定阈值 {threshold:.2%}。"
+            )
+        ),
     }
