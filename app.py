@@ -32,7 +32,9 @@ from backtest import build_backtest_figure, rolling_backtest
 
 
 THEME_COOKIE_NAME = "short_term_research_theme"
-THEME_COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+ANALYSIS_PERIOD_COOKIE_NAME = "short_term_research_analysis_period"
+STOCK_CODE_COOKIE_NAME = "short_term_research_stock_code"
+PREFERENCE_COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 10
 
 
 def get_saved_theme() -> str:
@@ -41,22 +43,57 @@ def get_saved_theme() -> str:
         saved_theme = st.context.cookies.get(THEME_COOKIE_NAME)
     except Exception:
         saved_theme = None
-    return "深色" if saved_theme == "dark" else "明亮"
+    return "深色" if str(saved_theme).strip().strip('"').lower() == "dark" else "明亮"
 
 
-def persist_theme_preference(theme_mode: str) -> None:
-    """把主题偏好写入当前浏览器，有效期一年。"""
+def get_saved_analysis_period(default_period: int = 250) -> int:
+    """读取当前浏览器上次使用的技术分析交易日数量。"""
+    try:
+        saved_period = int(st.context.cookies.get(ANALYSIS_PERIOD_COOKIE_NAME, default_period))
+    except (TypeError, ValueError, AttributeError):
+        saved_period = int(default_period)
+    return max(30, min(1000, saved_period))
+
+
+def get_saved_stock_code(default_code: str = "600519") -> str:
+    """读取当前浏览器最后一次使用的合法股票代码。"""
+    try:
+        saved_code = str(st.context.cookies.get(STOCK_CODE_COOKIE_NAME, default_code)).strip()
+        return normalize_stock_code(saved_code)
+    except Exception:
+        return normalize_stock_code(default_code)
+
+
+def persist_browser_preferences(theme_mode: str, period: int, stock_code: str) -> None:
+    """一次写入主题、分析周期和股票代码，避免多个偏好组件之间产生刷新竞态。"""
     theme_value = "dark" if theme_mode == "深色" else "light"
+    safe_period = max(30, min(1000, int(period)))
+    cookie_lines = [
+        f'"{THEME_COOKIE_NAME}={theme_value}; Path=/; Max-Age={PREFERENCE_COOKIE_MAX_AGE}; SameSite=Lax"',
+        f'"{ANALYSIS_PERIOD_COOKIE_NAME}={safe_period}; Path=/; Max-Age={PREFERENCE_COOKIE_MAX_AGE}; SameSite=Lax"',
+    ]
+    try:
+        safe_stock_code = normalize_stock_code(stock_code)
+        cookie_lines.append(
+            f'"{STOCK_CODE_COOKIE_NAME}={safe_stock_code}; Path=/; Max-Age={PREFERENCE_COOKIE_MAX_AGE}; SameSite=Lax"'
+        )
+    except DataFetchError:
+        pass
+    cookie_array = ",\n                ".join(cookie_lines)
     components.html(
         f"""
         <script>
         (() => {{
-            const preference = "{THEME_COOKIE_NAME}={theme_value}; Path=/; Max-Age={THEME_COOKIE_MAX_AGE}; SameSite=Lax";
-            try {{
-                window.parent.document.cookie = preference;
-            }} catch (error) {{
-                document.cookie = preference;
-            }}
+            const preferences = [
+                {cookie_array}
+            ];
+            preferences.forEach((preference) => {{
+                try {{
+                    window.parent.document.cookie = preference;
+                }} catch (error) {{
+                    document.cookie = preference;
+                }}
+            }});
         }})();
         </script>
         """,
@@ -897,10 +934,27 @@ def render_sidebar() -> tuple[str, str, int, list[str], dict]:
             key="ui_theme",
             help="明亮模式为白底黑字；深色模式为黑底白字。系统会在当前浏览器中记住你的选择。",
         )
-        persist_theme_preference(selected_theme)
-        default_code = st.session_state.get("selected_stock", "600519")
-        selected_code = st.text_input("股票代码", value=default_code, placeholder="例如 600519、000001、300750")
-        days = st.selectbox("分析周期", [30, 60, 120, 250], index=3)
+        selected_code = st.text_input(
+            "股票代码",
+            key="stock_code_input",
+            placeholder="例如 600519、000001、300750",
+            help="系统会在当前浏览器中记住最后一次使用的合法股票代码。",
+        )
+        try:
+            st.session_state["selected_stock"] = normalize_stock_code(selected_code)
+        except DataFetchError:
+            pass
+        days = int(
+            st.number_input(
+                "分析周期（交易日）",
+                min_value=30,
+                max_value=1000,
+                step=10,
+                key="analysis_period",
+                help="可输入 30～1000；系统会在当前浏览器中记住最后一次使用的数值。",
+            )
+        )
+        persist_browser_preferences(selected_theme, days, selected_code)
         threshold_choice = st.radio("阈值模式", ["自动（按波动调整）", "手动固定"], index=0)
         threshold_mode = "adaptive" if threshold_choice.startswith("自动") else "manual"
         if threshold_mode == "manual":
@@ -938,6 +992,7 @@ def render_sidebar() -> tuple[str, str, int, list[str], dict]:
                     col_select, col_delete = st.columns([3, 1])
                     if col_select.button(code, key=f"select_{code}", use_container_width=True):
                         st.session_state["selected_stock"] = code
+                        st.session_state["stock_code_input"] = code
                         st.rerun()
                     if col_delete.button("删除", key=f"delete_{code}", use_container_width=True):
                         ok, message = remove_from_watchlist(code)
@@ -1915,6 +1970,13 @@ def main():
     st.set_page_config(page_title="A股短线研究助手", layout="wide")
     if "ui_theme" not in st.session_state:
         st.session_state["ui_theme"] = get_saved_theme()
+    if "analysis_period" not in st.session_state:
+        default_period = int(load_config().get("default_period", 250))
+        st.session_state["analysis_period"] = get_saved_analysis_period(default_period)
+    if "selected_stock" not in st.session_state:
+        st.session_state["selected_stock"] = get_saved_stock_code()
+    if "stock_code_input" not in st.session_state:
+        st.session_state["stock_code_input"] = st.session_state["selected_stock"]
     apply_custom_theme(st.session_state["ui_theme"])
     st.title("短线研究工作台")
     st.markdown(
