@@ -262,6 +262,77 @@ def apply_custom_theme(theme_mode: str | None = None) -> None:
         margin: 3px 0;
     }
 
+    /* Treat the page switcher as navigation instead of a form-style radio list. */
+    [data-testid="stSidebar"] .st-key-feature_navigation,
+    [data-testid="stSidebar"] .st-key-feature_navigation .stRadio,
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] {
+        gap: 0.35rem;
+        width: 100% !important;
+    }
+
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label {
+        position: relative;
+        width: 100%;
+        box-sizing: border-box;
+        min-height: 2.75rem;
+        margin: 0;
+        padding: 0.68rem 0.85rem 0.68rem 1rem;
+        background: transparent !important;
+        border: 1px solid transparent !important;
+        border-radius: 7px;
+        cursor: pointer;
+        transition: background-color 140ms ease, border-color 140ms ease, transform 140ms ease;
+    }
+
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label:hover {
+        background: color-mix(in srgb, var(--panel-soft) 78%, var(--bg)) !important;
+        border-color: var(--line) !important;
+    }
+
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label:has(input:checked) {
+        background: color-mix(in srgb, var(--panel) 70%, var(--accent-soft)) !important;
+        border-color: var(--line-strong) !important;
+        box-shadow: 0 5px 16px color-mix(in srgb, var(--text) 8%, transparent);
+    }
+
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label:has(input:checked)::before {
+        content: "";
+        position: absolute;
+        inset: 0.55rem auto 0.55rem 0.38rem;
+        width: 3px;
+        border-radius: 999px;
+        background: var(--accent);
+    }
+
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label > div:first-child {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        opacity: 0;
+        pointer-events: none;
+    }
+
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label p {
+        font-weight: 580;
+        letter-spacing: 0.01em;
+    }
+
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label:has(input:checked) p {
+        font-weight: 720;
+    }
+
+    [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label:has(input:focus-visible) {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        [data-testid="stSidebar"] .st-key-feature_navigation div[role="radiogroup"] label {
+            transition: none;
+        }
+    }
+
     [data-testid="stSidebar"] h1,
     [data-testid="stSidebar"] h2,
     [data-testid="stSidebar"] h3 {
@@ -404,6 +475,34 @@ def apply_custom_theme(theme_mode: str | None = None) -> None:
     [data-testid="stSidebar"] .stButton > button *,
     [data-testid="stSidebar"] .stDownloadButton > button * {
         color: var(--button-text) !important;
+    }
+
+    [class*="st-key-clear_prediction_trend_drawings_"] button {
+        min-height: 2.25rem;
+        padding: 0.4rem 0.8rem;
+        background: var(--panel-soft) !important;
+        border: 1px solid var(--line-strong) !important;
+        color: var(--text) !important;
+        box-shadow: none !important;
+    }
+
+    [class*="st-key-clear_prediction_trend_drawings_"] button * {
+        color: var(--text) !important;
+    }
+
+    [class*="st-key-clear_prediction_trend_drawings_"] button:hover {
+        background: var(--accent-soft) !important;
+        border-color: var(--accent) !important;
+    }
+
+    [class*="st-key-clear_prediction_trend_drawings_"] button:disabled {
+        background: var(--panel-soft) !important;
+        color: var(--muted) !important;
+        opacity: 0.72;
+    }
+
+    [class*="st-key-clear_prediction_trend_drawings_"] button:disabled * {
+        color: var(--muted) !important;
     }
 
     .stCaptionContainer,
@@ -768,6 +867,128 @@ def build_realtime_minute_figure(minute_df: pd.DataFrame, quote: dict | None = N
     return style_plotly_figure(fig)
 
 
+def build_prediction_trend_figure(result: dict, history_days: int = 30) -> go.Figure | None:
+    """绘制历史收盘实线、未来情景中枢虚线和预测价位区间带。"""
+    data = result.get("data")
+    predictions = result.get("predictions", [])
+    if data is None or data.empty or not {"date", "close"}.issubset(data.columns):
+        return None
+
+    history = data[["date", "close"]].copy()
+    history["date"] = pd.to_datetime(history["date"], errors="coerce")
+    history["close"] = pd.to_numeric(history["close"], errors="coerce")
+    history = history.dropna().sort_values("date").tail(max(10, int(history_days)))
+    if history.empty:
+        return None
+
+    future_points = []
+    for item in predictions:
+        target_date = pd.to_datetime(item.get("预测日期"), errors="coerce")
+        interval = item.get("预测价位区间")
+        if pd.isna(target_date) or not interval or len(interval) != 2:
+            continue
+        try:
+            low, high = sorted([float(interval[0]), float(interval[1])])
+        except (TypeError, ValueError):
+            continue
+        future_points.append(
+            {
+                "date": target_date,
+                "period": str(item.get("周期", "")),
+                "direction": str(item.get("预测方向", "")),
+                "low": low,
+                "high": high,
+                "center": (low + high) / 2,
+            }
+        )
+    future_points.sort(key=lambda item: item["date"])
+    if not future_points:
+        return None
+
+    palette = get_theme_palette()
+    forecast_color = "#7c9cc4"
+    range_fill = "rgba(124, 156, 196, 0.16)"
+    history_labels = history["date"].dt.strftime("%Y-%m-%d").tolist()
+    history_prices = history["close"].astype(float).tolist()
+    last_label = history_labels[-1]
+    last_close = history_prices[-1]
+    forecast_labels = [last_label] + [item["date"].strftime("%Y-%m-%d") for item in future_points]
+    lower_values = [last_close] + [item["low"] for item in future_points]
+    upper_values = [last_close] + [item["high"] for item in future_points]
+    center_values = [last_close] + [item["center"] for item in future_points]
+    forecast_details = ["最新完整收盘"] + [f"{item['period']} · {item['direction']}" for item in future_points]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=history_labels,
+            y=history_prices,
+            mode="lines",
+            name="历史收盘价",
+            line=dict(color=palette["text"], width=2.2, dash="solid"),
+            hovertemplate="日期 %{x}<br>历史收盘价 %{y:.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=forecast_labels,
+            y=lower_values,
+            mode="lines",
+            line=dict(width=0),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=forecast_labels,
+            y=upper_values,
+            mode="lines",
+            name="预测价位区间",
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor=range_fill,
+            hovertemplate="日期 %{x}<br>区间上界 %{y:.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=forecast_labels,
+            y=center_values,
+            mode="lines+markers",
+            name="预测情景中枢",
+            line=dict(color=forecast_color, width=2.4, dash="dash"),
+            marker=dict(color=forecast_color, size=[0] + [8] * len(future_points)),
+            customdata=forecast_details,
+            hovertemplate="日期 %{x}<br>%{customdata}<br>情景中枢 %{y:.2f}<extra></extra>",
+        )
+    )
+    fig.add_vline(x=last_label, line_width=1, line_dash="dot", line_color=palette["line_strong"])
+    fig.add_annotation(
+        x=last_label,
+        y=1,
+        xref="x",
+        yref="paper",
+        text="历史 / 预测",
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom",
+        font=dict(color=palette["muted"], size=11),
+    )
+    fig.update_layout(
+        hovermode="x unified",
+        xaxis=dict(
+            title="交易日",
+            type="category",
+            categoryorder="array",
+            categoryarray=history_labels + forecast_labels[1:],
+            nticks=10,
+        ),
+        yaxis=dict(title="价格（元）", fixedrange=False),
+    )
+    return style_plotly_figure(fig, height=410)
+
+
 def build_compare_analysis_row(dataset: dict, period: int) -> dict:
     """整理多股对比中的单只股票技术分析摘要。"""
     df = dataset["df"]
@@ -900,13 +1121,16 @@ def summarize_prediction_basis(item: dict) -> str:
     return "，".join(str(signal) for signal in signals[:3] if signal)[:42]
 
 
-def get_plotly_config() -> dict:
+def get_plotly_config(include_shape_eraser: bool = True) -> dict:
     """返回 Plotly 图表交互配置，支持滚轮缩放和模式栏操作。"""
+    drawing_buttons = ["drawline"]
+    if include_shape_eraser:
+        drawing_buttons.append("eraseshape")
     return {
         "scrollZoom": True,
         "displayModeBar": True,
         "displaylogo": False,
-        "modeBarButtonsToAdd": ["drawline", "eraseshape"],
+        "modeBarButtonsToAdd": drawing_buttons,
         "toImageButtonOptions": {"format": "png", "filename": "stock_analysis_chart", "scale": 2},
     }
 
@@ -925,6 +1149,14 @@ def clear_run_status(status) -> None:
         status.empty()
     except Exception:
         pass
+
+
+def select_watchlist_stock(stock_code: str, state=None) -> None:
+    """在控件重建前切换自选股，避免修改已实例化输入框的状态。"""
+    code = normalize_stock_code(stock_code)
+    target_state = st.session_state if state is None else state
+    target_state["selected_stock"] = code
+    target_state["stock_code_input"] = code
 
 
 def render_sidebar() -> tuple[str, str, int, list[str], dict]:
@@ -974,6 +1206,7 @@ def render_sidebar() -> tuple[str, str, int, list[str], dict]:
         feature = st.radio(
             "功能选择",
             ["个股技术分析", "1-3 日走势预测", "批量样本积累", "模型回测", "分析报告"],
+            key="feature_navigation",
         )
 
         st.divider()
@@ -995,10 +1228,13 @@ def render_sidebar() -> tuple[str, str, int, list[str], dict]:
                 st.caption("点击股票代码可切换当前研究对象。")
                 for code in watchlist:
                     col_select, col_delete = st.columns([3, 1])
-                    if col_select.button(code, key=f"select_{code}", use_container_width=True):
-                        st.session_state["selected_stock"] = code
-                        st.session_state["stock_code_input"] = code
-                        st.rerun()
+                    col_select.button(
+                        code,
+                        key=f"select_{code}",
+                        use_container_width=True,
+                        on_click=select_watchlist_stock,
+                        args=(code,),
+                    )
                     if col_delete.button("删除", key=f"delete_{code}", use_container_width=True):
                         ok, message = remove_from_watchlist(code)
                         if ok:
@@ -1589,6 +1825,41 @@ def render_short_term_prediction(
     else:
         st.info(f"当前使用手动固定阈值：±{threshold:.2%}。")
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    show_prediction_trend = st.toggle(
+        "显示历史与未来走势图",
+        value=False,
+        key=f"show_prediction_trend_{code}",
+        help="打开后显示历史收盘实线、未来预测虚线和价位区间带。",
+    )
+    if show_prediction_trend:
+        trend_figure = build_prediction_trend_figure(result)
+    else:
+        trend_figure = None
+    if show_prediction_trend and trend_figure is not None:
+        st.subheader("历史与未来 1-3 日走势")
+        chart_reset_key = f"prediction_trend_chart_reset_{code}"
+        chart_revision = int(st.session_state.get(chart_reset_key, 0))
+        if st.button(
+            "清除手动画线",
+            key=f"clear_prediction_trend_drawings_{code}",
+            help="清除你在这张走势图上手动画出的全部线条，不影响历史和预测数据。",
+        ):
+            chart_revision += 1
+            st.session_state[chart_reset_key] = chart_revision
+        st.plotly_chart(
+            trend_figure,
+            use_container_width=True,
+            config=get_plotly_config(include_shape_eraser=False),
+            key=f"prediction_trend_chart_{code}_{chart_revision}",
+        )
+        st.caption(
+            "历史收盘价使用实线；未来虚线连接各周期预测价位区间的中枢，淡色带表示对应区间。"
+            "点击“清除手动画线”可一次清空你在图上添加的线条。"
+            "虚线不是确定收盘价或目标价，仅用于直观展示当前模型情景。"
+        )
+    elif show_prediction_trend:
+        st.caption("当前预测数据缺少可用价位区间，暂时无法绘制走势图。")
 
     next_day = next((item for item in result["predictions"] if item.get("周期") == "1日"), None)
     if next_day and next_day.get("区间估算"):
