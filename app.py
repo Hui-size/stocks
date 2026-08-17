@@ -21,7 +21,7 @@ from feedback import (
 from indicators import add_all_indicators
 from market import describe_market_sentiment, fetch_market_activity, get_major_indices
 from news import fetch_stock_announcements, fetch_stock_news
-from prediction import predict_short_term
+from prediction import predict_short_term, prediction_session_key
 from realtime import RealtimeQuoteError, compare_realtime_with_prediction, fetch_realtime_minute, fetch_realtime_quote
 from report import generate_markdown_report
 from scoring import build_score
@@ -526,7 +526,12 @@ def get_news_dataset(stock_code: str) -> dict:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_prediction_dataset(stock_code: str, threshold: float, threshold_mode: str = "manual") -> dict:
+def get_prediction_dataset(
+    stock_code: str,
+    threshold: float,
+    threshold_mode: str = "manual",
+    session_key: str = "",
+) -> dict:
     """带缓存获取 1-3 日短线预测结果。"""
     return predict_short_term(stock_code, threshold=threshold, threshold_mode=threshold_mode)
 
@@ -1480,7 +1485,7 @@ def render_short_term_prediction(
 
     run_status = st.status("正在获取历史行情并训练短线模型...", expanded=True)
     try:
-        result = get_prediction_dataset(code, threshold, threshold_mode)
+        result = get_prediction_dataset(code, threshold, threshold_mode, prediction_session_key())
         update_run_status(run_status, "短线模型训练和 1-3 日预测已完成。", state="running")
     except Exception as exc:
         update_run_status(run_status, "短线预测加载失败。", state="error")
@@ -1577,6 +1582,8 @@ def render_short_term_prediction(
         f"最近一个已获取交易日：{result.get('last_trade_date', '暂无')}。"
         f"预测日期来源：{result.get('calendar_source', '暂无')}。"
     )
+    if result.get("prediction_session_note"):
+        st.caption(result["prediction_session_note"])
     if result.get("threshold_mode") == "adaptive":
         st.info("当前使用波动自适应阈值：每个周期和每个历史时点都按当时近20日波动计算，不使用未来数据。")
     else:
@@ -1659,6 +1666,8 @@ def render_short_term_prediction(
             source_df = pd.DataFrame(feedback_summary["by_source"])
             source_df["准确率"] = source_df["准确率"].map(lambda value: "暂无" if pd.isna(value) else f"{value:.1%}")
             source_df["校准权重"] = source_df["校准权重"].map(lambda value: f"{value:.2f}")
+            if "有效权重" in source_df.columns:
+                source_df["有效权重"] = source_df["有效权重"].map(lambda value: f"{value:.2f}")
             with st.expander("查看样本来源", expanded=False):
                 st.dataframe(source_df, use_container_width=True, hide_index=True)
 
@@ -1671,7 +1680,11 @@ def render_short_term_prediction(
 
         if feedback_summary["by_horizon"]:
             horizon_df = pd.DataFrame(feedback_summary["by_horizon"])
-            horizon_df["准确率"] = horizon_df["准确率"].map(lambda value: f"{value:.1%}")
+            horizon_df["准确率"] = horizon_df["准确率"].map(
+                lambda value: "暂无" if pd.isna(value) else f"{value:.1%}"
+            )
+            if "有效权重" in horizon_df.columns:
+                horizon_df["有效权重"] = horizon_df["有效权重"].map(lambda value: f"{value:.2f}")
             st.write("**分周期复盘表现**")
             st.dataframe(horizon_df, use_container_width=True, hide_index=True)
 
@@ -1812,7 +1825,7 @@ def render_batch_prediction_collector(
                     continue
 
             update_run_status(run_status, f"{code}：正在获取历史行情并训练模型...", state="running")
-            result = get_prediction_dataset(code, threshold, threshold_mode)
+            result = get_prediction_dataset(code, threshold, threshold_mode, prediction_session_key())
             update_run_status(run_status, f"{code}：正在复盘已有样本并应用校准...", state="running")
             update_prediction_outcomes(code, threshold, hist_df=result.get("data"))
             result = apply_feedback_calibration(code, result)
@@ -1889,6 +1902,13 @@ def render_model_backtest(
     )
     st.caption("为控制本地计算耗时，系统每天生成推演结果，但模型每 20 个交易日重新训练一次。")
 
+    request_key = f"{code}|{test_days}|{threshold:.6f}|{threshold_mode}"
+    if st.button("开始滚动回测", type="primary", key="start_model_backtest"):
+        st.session_state["active_backtest_request"] = request_key
+    if st.session_state.get("active_backtest_request") != request_key:
+        st.info("请选择历史回放范围，然后点击“开始滚动回测”。页面打开时不再自动训练模型。")
+        return
+
     run_status = st.status("正在获取历史行情并执行滚动回测...", expanded=True)
     try:
         result = get_backtest_dataset(code, threshold, test_days=test_days, threshold_mode=threshold_mode)
@@ -1898,9 +1918,28 @@ def render_model_backtest(
         st.error(f"模型回测暂不可用：{exc}")
         return
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     col1.metric("最近 60 个交易日预测准确率", "暂无" if result["accuracy_60"] is None else f"{result['accuracy_60']:.1%}")
     col2.metric("最近 120 个交易日预测准确率", "暂无" if result["accuracy_120"] is None else f"{result['accuracy_120']:.1%}")
+    col3.metric("三类均衡准确率", "暂无" if result["balanced_accuracy"] is None else f"{result['balanced_accuracy']:.1%}")
+    st.caption("均衡准确率分别考察上涨、震荡、下跌的识别能力，能识别只猜多数类别造成的虚高准确率。")
+
+    distribution_rows = []
+    for label in ["上涨", "震荡", "下跌"]:
+        distribution_rows.append(
+            {
+                "走势": label,
+                "预测占比": f"{result['prediction_distribution'][label]:.1%}",
+                "实际占比": f"{result['actual_distribution'][label]:.1%}",
+            }
+        )
+    st.subheader("方向分布检查")
+    st.dataframe(pd.DataFrame(distribution_rows), use_container_width=True, hide_index=True)
+    if result["collapse_warning"]:
+        st.warning(
+            "本次回测中“震荡”预测超过 85%，说明模型的方向区分能力仍偏弱。"
+            "系统不会为了让结果好看而强行分配上涨或下跌，请结合均衡准确率和错误样本复盘。"
+        )
 
     accuracy_rows = []
     for name, value in result["accuracy_by_horizon"].items():
@@ -1924,12 +1963,16 @@ def render_model_backtest(
         if replay_result["added"]:
             st.success(
                 f"已新增 {replay_result['added']} 条历史推演样本，"
-                f"折合校准样本权重约 {replay_result['effective_added']:.1f}；"
+                f"本次新增有效权重约 {replay_result['effective_added']:.1f}，"
+                f"历史样本当前总有效权重约 {replay_result.get('effective_total', 0):.1f}；"
                 f"另有 {replay_result['skipped']} 条重复或无效记录已跳过。"
             )
         else:
             st.info(f"本次没有新增样本，{replay_result['skipped']} 条记录均已存在或无效。")
-    st.caption("历史回放能加快发现模型偏差，但它不是新的市场信息，不能替代后续真实预测复盘。")
+    st.caption(
+        "历史样本按约 180 天半衰期降低旧数据影响，总有效权重会封顶；"
+        "日常真实预测持续增加后，历史样本影响会被限制在真实样本的约 30%。"
+    )
 
     backtest_results = result["results"]
     if backtest_results.empty or not {"actual", "predicted"}.issubset(backtest_results.columns):
@@ -1958,7 +2001,7 @@ def render_model_backtest(
             use_container_width=True,
             hide_index=True,
         )
-        st.caption("错误样本按日期倒序展示，便于结合当时行情环境人工复盘。")
+        st.caption("这里只展示错判记录，不代表全部预测分布；完整占比请看上方“方向分布检查”。错误样本按日期倒序展示。")
 
     st.info(result["note"])
     st.caption("回测结果只说明历史表现，不代表未来一定准确。")

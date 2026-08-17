@@ -11,10 +11,12 @@ from prediction import (
     _blend_probabilities,
     _confidence_from_probs,
     _extract_ensemble_probs,
+    _extract_ensemble_probability_frame,
     _fit_model_ensemble,
     _refit_model_ensemble,
     _recent_label_probs,
     _rule_probabilities,
+    _select_prediction_direction,
 )
 
 
@@ -23,6 +25,26 @@ def _safe_accuracy(df: pd.DataFrame) -> float | None:
     if df.empty:
         return None
     return float((df["actual"] == df["predicted"]).mean())
+
+
+def _safe_balanced_accuracy(df: pd.DataFrame) -> float | None:
+    """计算各类别召回率的平均值，避免多数类准确率掩盖方向失灵。"""
+    if df.empty:
+        return None
+    recalls = []
+    for label in LABELS:
+        actual_label = df[df["actual"] == label]
+        if not actual_label.empty:
+            recalls.append(float((actual_label["predicted"] == label).mean()))
+    return float(sum(recalls) / len(recalls)) if recalls else None
+
+
+def _direction_distribution(df: pd.DataFrame, column: str) -> dict:
+    """返回固定顺序的三分类占比。"""
+    if df.empty or column not in df.columns:
+        return {label: 0.0 for label in LABELS}
+    counts = df[column].value_counts(normalize=True)
+    return {label: float(counts.get(label, 0.0)) for label in LABELS}
 
 
 def _fit_predict_window(
@@ -64,7 +86,12 @@ def _fit_predict_window(
     recent_probs = _recent_label_probs(train_df, label_col)
     rule_probs, _, _, _ = _rule_probabilities(test_row, horizon)
     probabilities = _blend_probabilities(model_probs, recent_probs, rule_probs, model["cv_score"])
-    predicted = max(probabilities, key=probabilities.get)
+    predicted, decision_reason = _select_prediction_direction(
+        probabilities,
+        model_probs=model_probs,
+        rule_probs=rule_probs,
+        model_score=model["cv_score"],
+    )
     return {
         "predicted": predicted,
         "up_prob": probabilities["上涨"],
@@ -74,6 +101,7 @@ def _fit_predict_window(
         "model": f"历史滚动时间隔离集成（{model['name']}）",
         "validation_balanced_accuracy": model["cv_score"],
         "validation_log_loss": model["cv_log_loss"],
+        "decision_reason": decision_reason,
     }, model
 
 
@@ -109,50 +137,112 @@ def rolling_backtest(
         ensemble_template = None
         model_train_samples = 0
         retrain_count = 0
-        for idx in range(start, len(usable)):
+        idx = start
+        while idx < len(usable):
             # 在测试日只能使用目标结果已经发生的训练标签。
             train_end = idx - horizon + 1
             train_start = max(0, train_end - train_window)
-            train_df = usable.iloc[train_start:train_end]
-            test_row = usable.iloc[idx]
-            should_retrain = fitted_model is None or (idx - start) % max(1, retrain_interval) == 0
-            if should_retrain:
+            training_slice = usable.iloc[train_start:train_end].dropna(subset=FEATURE_COLUMNS + [label_col])
+            model_train_samples = len(training_slice)
+            retrain_count += 1
+            if retrain_count == 1 or (retrain_count - 1) % 3 == 0:
+                ensemble_template = None
+            if len(training_slice) < 160 or training_slice[label_col].nunique() < 2:
                 fitted_model = None
-                model_train_samples = len(train_df)
-                retrain_count += 1
-                if retrain_count == 1 or (retrain_count - 1) % 3 == 0:
-                    ensemble_template = None
-            prediction, fitted_model = _fit_predict_window(
-                train_df,
-                test_row,
-                label_col,
-                horizon,
-                fitted_model=fitted_model,
-                ensemble_template=ensemble_template,
-            )
+            elif ensemble_template is None:
+                fitted_model = _fit_model_ensemble(
+                    training_slice[FEATURE_COLUMNS],
+                    training_slice[label_col],
+                    horizon,
+                )
+            else:
+                fitted_model = _refit_model_ensemble(
+                    ensemble_template,
+                    training_slice[FEATURE_COLUMNS],
+                    training_slice[label_col],
+                )
             if fitted_model is not None:
                 ensemble_template = fitted_model
-            rows.append(
-                {
-                    "date": test_row["date"],
-                    "target_date": test_row[target_date_col],
-                    "predicted": prediction["predicted"],
-                    "actual": str(test_row[label_col]),
-                    "actual_return": float(test_row[return_col]),
-                    "horizon": horizon,
-                    "up_prob": prediction["up_prob"],
-                    "flat_prob": prediction["flat_prob"],
-                    "down_prob": prediction["down_prob"],
-                    "confidence": prediction["confidence"],
-                    "model": prediction["model"],
-                    "validation_balanced_accuracy": prediction.get("validation_balanced_accuracy"),
-                    "validation_log_loss": prediction.get("validation_log_loss"),
-                    "train_samples": model_train_samples,
-                    "label_threshold": float(test_row.get(f"label_threshold_{horizon}d", threshold)),
-                    "threshold_mode": normalized_mode,
-                    "label_version": ADAPTIVE_THRESHOLD_VERSION if normalized_mode == "adaptive" else "fixed_v1",
-                }
+            segment_end = min(len(usable), idx + max(1, retrain_interval))
+            segment = usable.iloc[idx:segment_end]
+            probability_frame = (
+                _extract_ensemble_probability_frame(fitted_model, segment[FEATURE_COLUMNS])
+                if fitted_model is not None
+                else None
             )
+            for test_idx in range(idx, segment_end):
+                test_row = usable.iloc[test_idx]
+                current_train_end = test_idx - horizon + 1
+                current_train_start = max(0, current_train_end - train_window)
+                current_train = usable.iloc[current_train_start:current_train_end]
+                if fitted_model is None or probability_frame is None:
+                    probabilities = {"上涨": 0.2, "震荡": 0.6, "下跌": 0.2}
+                    model_probs = probabilities.copy()
+                    recent_probs = probabilities.copy()
+                    rule_probs = probabilities.copy()
+                    predicted = "震荡"
+                    confidence = "低"
+                    model_name = "历史回放规则回退"
+                    validation_accuracy = None
+                    validation_loss = None
+                else:
+                    model_probs = probability_frame.loc[test_row.name].to_dict()
+                    recent_probs = _recent_label_probs(current_train, label_col)
+                    rule_probs, _, _, _ = _rule_probabilities(test_row, horizon)
+                    probabilities = _blend_probabilities(
+                        model_probs,
+                        recent_probs,
+                        rule_probs,
+                        fitted_model["cv_score"],
+                    )
+                    predicted, decision_reason = _select_prediction_direction(
+                        probabilities,
+                        model_probs=model_probs,
+                        rule_probs=rule_probs,
+                        model_score=fitted_model["cv_score"],
+                    )
+                    confidence = _confidence_from_probs(
+                        probabilities,
+                        fitted_model["cv_score"],
+                        low_reliability=False,
+                    )
+                    model_name = f"历史滚动时间隔离集成（{fitted_model['name']}）"
+                    validation_accuracy = fitted_model["cv_score"]
+                    validation_loss = fitted_model["cv_log_loss"]
+                if fitted_model is None or probability_frame is None:
+                    decision_reason = "历史训练样本不足，使用保守震荡回退"
+                rows.append(
+                    {
+                        "date": test_row["date"],
+                        "target_date": test_row[target_date_col],
+                        "predicted": predicted,
+                        "actual": str(test_row[label_col]),
+                        "actual_return": float(test_row[return_col]),
+                        "horizon": horizon,
+                        "up_prob": probabilities["上涨"],
+                        "flat_prob": probabilities["震荡"],
+                        "down_prob": probabilities["下跌"],
+                        "model_up_prob": model_probs["上涨"],
+                        "model_flat_prob": model_probs["震荡"],
+                        "model_down_prob": model_probs["下跌"],
+                        "recent_up_prob": recent_probs["上涨"],
+                        "recent_flat_prob": recent_probs["震荡"],
+                        "recent_down_prob": recent_probs["下跌"],
+                        "rule_up_prob": rule_probs["上涨"],
+                        "rule_flat_prob": rule_probs["震荡"],
+                        "rule_down_prob": rule_probs["下跌"],
+                        "confidence": confidence,
+                        "model": model_name,
+                        "validation_balanced_accuracy": validation_accuracy,
+                        "validation_log_loss": validation_loss,
+                        "decision_reason": decision_reason,
+                        "train_samples": model_train_samples,
+                        "label_threshold": float(test_row.get(f"label_threshold_{horizon}d", threshold)),
+                        "threshold_mode": normalized_mode,
+                        "label_version": ADAPTIVE_THRESHOLD_VERSION if normalized_mode == "adaptive" else "fixed_v1",
+                    }
+                )
+            idx = segment_end
         result_df = pd.DataFrame(rows)
         results[horizon] = result_df
 
@@ -161,11 +251,18 @@ def rolling_backtest(
     recent_120 = combined.groupby("horizon").tail(120) if not combined.empty else pd.DataFrame()
     accuracy_by_horizon = {f"{h}日预测准确率": _safe_accuracy(results[h]) for h in [1, 2, 3]}
     confusion = pd.crosstab(combined["actual"], combined["predicted"], rownames=["实际走势"], colnames=["预测走势"]).reindex(index=LABELS, columns=LABELS, fill_value=0) if not combined.empty else pd.DataFrame(index=LABELS, columns=LABELS).fillna(0)
+    prediction_distribution = _direction_distribution(combined, "predicted")
+    actual_distribution = _direction_distribution(combined, "actual")
+    flat_prediction_ratio = prediction_distribution["震荡"]
     return {
         "rows": len(hist_df),
         "accuracy_60": _safe_accuracy(recent_60),
         "accuracy_120": _safe_accuracy(recent_120),
         "accuracy_by_horizon": accuracy_by_horizon,
+        "balanced_accuracy": _safe_balanced_accuracy(combined),
+        "prediction_distribution": prediction_distribution,
+        "actual_distribution": actual_distribution,
+        "collapse_warning": flat_prediction_ratio >= 0.85,
         "confusion_matrix": confusion,
         "results": combined,
         "threshold_mode": normalized_mode,

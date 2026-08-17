@@ -8,6 +8,9 @@ from prediction import fetch_prediction_history
 
 
 FEEDBACK_FILE = Path("prediction_feedback.json")
+HISTORICAL_WEIGHT_HALF_LIFE_DAYS = 180
+HISTORICAL_BOOTSTRAP_WEIGHT_CAP = 12.0
+HISTORICAL_REAL_SAMPLE_RATIO_CAP = 0.30
 
 
 def load_feedback(path: Path = FEEDBACK_FILE) -> list[dict]:
@@ -43,6 +46,34 @@ def _sample_weight(record: dict) -> float:
         return max(0.0, float(record.get("sample_weight", default)))
     except (TypeError, ValueError):
         return default
+
+
+def _calibration_weight_map(records: list[dict]) -> dict[str, float]:
+    """按时间衰减历史样本，并限制其相对真实预测的总影响。"""
+    daily_records = [item for item in records if _sample_source(item) != "历史滚动推演"]
+    historical_records = [item for item in records if _sample_source(item) == "历史滚动推演"]
+    weights = {_record_key(item): _sample_weight(item) for item in daily_records}
+    if not historical_records:
+        return weights
+
+    parsed_dates = [pd.to_datetime(item.get("base_date"), errors="coerce") for item in historical_records]
+    valid_dates = [value for value in parsed_dates if pd.notna(value)]
+    latest_date = max(valid_dates) if valid_dates else pd.Timestamp.today().normalize()
+    raw_historical_weights = {}
+    for item, base_date in zip(historical_records, parsed_dates):
+        age_days = max(0, int((latest_date - base_date).days)) if pd.notna(base_date) else HISTORICAL_WEIGHT_HALF_LIFE_DAYS
+        recency_weight = 0.5 ** (age_days / HISTORICAL_WEIGHT_HALF_LIFE_DAYS)
+        raw_historical_weights[_record_key(item)] = _sample_weight(item) * recency_weight
+
+    daily_total = sum(weights.values())
+    historical_cap = max(
+        HISTORICAL_BOOTSTRAP_WEIGHT_CAP,
+        daily_total * HISTORICAL_REAL_SAMPLE_RATIO_CAP,
+    )
+    raw_total = sum(raw_historical_weights.values())
+    scale = min(1.0, historical_cap / raw_total) if raw_total > 0 else 0.0
+    weights.update({key: value * scale for key, value in raw_historical_weights.items()})
+    return weights
 
 
 def _label_version(record: dict) -> str:
@@ -160,9 +191,18 @@ def record_historical_replay(
 ) -> dict:
     """把无未来数据泄漏的滚动回测结果写入复盘系统。"""
     if results is None or results.empty:
-        return {"added": 0, "skipped": 0, "total": 0, "effective_added": 0.0}
+        return {"added": 0, "skipped": 0, "total": 0, "effective_added": 0.0, "effective_total": 0.0}
 
     records = load_feedback(path)
+    before_group = [
+        item for item in records if item.get("code") == stock_code and item.get("status") == "evaluated"
+    ]
+    before_weights = _calibration_weight_map(before_group)
+    before_historical_weight = sum(
+        before_weights.get(_record_key(item), 0.0)
+        for item in before_group
+        if _sample_source(item) == "历史滚动推演"
+    )
     existing = {_record_key(item) for item in records}
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     added = 0
@@ -226,11 +266,21 @@ def record_historical_replay(
 
     if added:
         save_feedback(records, path)
+    after_group = [
+        item for item in records if item.get("code") == stock_code and item.get("status") == "evaluated"
+    ]
+    after_weights = _calibration_weight_map(after_group)
+    after_historical_weight = sum(
+        after_weights.get(_record_key(item), 0.0)
+        for item in after_group
+        if _sample_source(item) == "历史滚动推演"
+    )
     return {
         "added": added,
         "skipped": skipped,
         "total": len(results),
-        "effective_added": added * 0.35,
+        "effective_added": max(0.0, after_historical_weight - before_historical_weight),
+        "effective_total": after_historical_weight,
     }
 
 
@@ -305,6 +355,7 @@ def summarize_feedback(stock_code: str, path: Path = FEEDBACK_FILE) -> dict:
     records = [item for item in load_feedback(path) if item.get("code") == stock_code]
     evaluated = [item for item in records if item.get("status") == "evaluated"]
     pending = [item for item in records if item.get("status") != "evaluated"]
+    effective_weights = _calibration_weight_map(evaluated)
     by_source = []
     for source in sorted({_sample_source(item) for item in records}):
         group = [item for item in records if _sample_source(item) == source]
@@ -319,6 +370,7 @@ def summarize_feedback(stock_code: str, path: Path = FEEDBACK_FILE) -> dict:
                 "已复盘": len(evaluated_group),
                 "准确率": source_accuracy,
                 "校准权重": _sample_weight(group[0]) if group else 0.0,
+                "有效权重": sum(effective_weights.get(_record_key(item), 0.0) for item in evaluated_group),
             }
         )
 
@@ -353,12 +405,24 @@ def summarize_feedback(stock_code: str, path: Path = FEEDBACK_FILE) -> dict:
             "summary": "暂无已完成复盘的预测记录。等后续交易日行情更新后，系统会自动核对预测与实际走势。",
         }
 
-    accuracy = sum(1 for item in evaluated if item.get("is_correct")) / len(evaluated)
+    total_effective_weight = sum(effective_weights.values())
+    accuracy = (
+        sum(effective_weights.get(_record_key(item), 0.0) for item in evaluated if item.get("is_correct"))
+        / total_effective_weight
+        if total_effective_weight > 0
+        else None
+    )
     by_horizon = []
     for horizon in sorted({item.get("horizon") for item in evaluated}):
         group = [item for item in evaluated if item.get("horizon") == horizon]
-        acc = sum(1 for item in group if item.get("is_correct")) / len(group)
-        by_horizon.append({"周期": horizon, "样本数": len(group), "准确率": acc})
+        group_weight = sum(effective_weights.get(_record_key(item), 0.0) for item in group)
+        acc = (
+            sum(effective_weights.get(_record_key(item), 0.0) for item in group if item.get("is_correct"))
+            / group_weight
+            if group_weight > 0
+            else None
+        )
+        by_horizon.append({"周期": horizon, "样本数": len(group), "有效权重": group_weight, "准确率": acc})
 
     mistakes = [item for item in evaluated if not item.get("is_correct")]
     mistake_pairs: dict[str, int] = {}
@@ -449,14 +513,15 @@ def apply_feedback_calibration(stock_code: str, prediction_result: dict, path: P
         and item.get("predicted")
         and _label_version(item) == target_label_version
     ]
-    if sum(_sample_weight(item) for item in records) < 6:
+    calibration_weights = _calibration_weight_map(records)
+    if sum(calibration_weights.values()) < 6:
         return prediction_result
 
     stats: dict[str, dict] = {}
     for item in records:
         predicted = item.get("predicted")
         actual = item.get("actual")
-        weight = _sample_weight(item)
+        weight = calibration_weights.get(_record_key(item), 0.0)
         bucket = stats.setdefault(predicted, {"total": 0, "wrong": 0, "actual": {}})
         bucket["total"] += weight
         if not item.get("is_correct"):

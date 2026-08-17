@@ -1,4 +1,6 @@
+from datetime import time
 from math import log, sqrt
+from zoneinfo import ZoneInfo
 
 import akshare as ak
 import pandas as pd
@@ -108,6 +110,79 @@ def next_trade_dates(last_date, count: int = 3) -> tuple[list[pd.Timestamp], str
         if current.weekday() < 5:
             dates.append(current)
     return dates, "周末过滤备用规则"
+
+
+def _shanghai_now(now=None) -> pd.Timestamp:
+    """返回明确使用中国时区的当前时间，测试时可注入指定时刻。"""
+    current = pd.Timestamp.now(tz=ZoneInfo("Asia/Shanghai")) if now is None else pd.Timestamp(now)
+    if current.tzinfo is None:
+        return current.tz_localize(ZoneInfo("Asia/Shanghai"))
+    return current.tz_convert(ZoneInfo("Asia/Shanghai"))
+
+
+def prediction_session_key(now=None) -> str:
+    """生成预测缓存时段键，确保交易日收盘时自动切换预测日期。"""
+    current = _shanghai_now(now)
+    phase = "after_close" if current.time() >= time(15, 0) else "before_close"
+    return f"{current:%Y-%m-%d}|{phase}"
+
+
+def prepare_prediction_session(hist_df: pd.DataFrame, now=None) -> tuple[pd.DataFrame, list[pd.Timestamp], str, str]:
+    """按A股收盘时点确定完整K线和预测交易日。"""
+    if hist_df is None or hist_df.empty:
+        raise DataFetchError("预测行情为空，无法确定预测交易日。")
+
+    current = _shanghai_now(now)
+    today = pd.Timestamp(current.date())
+    data = hist_df.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
+    data = data.dropna(subset=["date"]).sort_values("date")
+    data = data[data["date"] <= today]
+
+    try:
+        calendar = fetch_trade_calendar().dt.normalize().drop_duplicates().sort_values()
+        is_trade_day = bool((calendar == today).any())
+        before_close = is_trade_day and current.time() < time(15, 0)
+        if before_close:
+            # 日K接口盘中可能已经返回当日未完成K线，训练和基准价必须排除该行。
+            data = data[data["date"] < today]
+            target_dates = calendar[calendar >= today].head(3).tolist()
+            session_note = "当前交易日15:00收盘前：使用上一完整交易日收盘数据，1日预测对应今天。"
+        else:
+            target_dates = calendar[calendar > today].head(3).tolist()
+            session_note = (
+                "当前交易日已收盘：1日预测对应下一交易日。"
+                if is_trade_day
+                else "当前为非交易日：1日预测对应下一交易日。"
+            )
+        if len(target_dates) >= 3:
+            source = "A股交易日历（按15:00收盘切换）"
+        else:
+            raise DataFetchError("交易日历未来日期不足。")
+    except Exception:
+        is_trade_day = today.weekday() < 5
+        before_close = is_trade_day and current.time() < time(15, 0)
+        if before_close:
+            data = data[data["date"] < today]
+            first_date = today
+            session_note = "当前工作日15:00收盘前：使用上一完整交易日收盘数据，1日预测对应今天。"
+        else:
+            first_date = today + pd.Timedelta(days=1)
+            session_note = "当前时段：1日预测对应下一工作日（交易日历接口暂不可用）。"
+        target_dates = []
+        candidate = first_date
+        while len(target_dates) < 3:
+            if candidate.weekday() < 5:
+                target_dates.append(candidate)
+            candidate += pd.Timedelta(days=1)
+        source = "工作日过滤备用规则（按15:00收盘切换）"
+
+    if data.empty:
+        raise DataFetchError("排除盘中未完成K线后没有可用历史行情。")
+    latest_complete_date = pd.to_datetime(data.iloc[-1]["date"]).normalize()
+    if not before_close and is_trade_day and latest_complete_date < today:
+        session_note += f" 数据源尚未更新今日完整收盘K线，当前基准数据最新到{latest_complete_date:%Y-%m-%d}。"
+    return data.reset_index(drop=True), target_dates, source, session_note
 
 
 def fetch_prediction_history(stock_code: str, years: int = 3) -> pd.DataFrame:
@@ -550,6 +625,27 @@ def _blend_probabilities(model_probs: dict, recent_probs: dict, rule_probs: dict
     return _normalize_probs(blended)
 
 
+def _select_prediction_direction(
+    probabilities: dict,
+    model_probs: dict | None = None,
+    rule_probs: dict | None = None,
+    model_score: float | None = None,
+) -> tuple[str, str]:
+    """选择最终方向，避免近期多数类把一致的方向信号机械压成震荡。"""
+    blended_direction = max(probabilities, key=probabilities.get)
+    if blended_direction != "震荡" or not model_probs or not rule_probs:
+        return blended_direction, ""
+
+    model_direction = max(model_probs, key=model_probs.get)
+    rule_direction = max(rule_probs, key=rule_probs.get)
+    directional_agreement = model_direction == rule_direction and model_direction in {"上涨", "下跌"}
+    model_probability = float(model_probs.get(model_direction, 0.0))
+    validation_score = float(model_score or 0.0)
+    if directional_agreement and model_probability >= 0.34 and validation_score >= 0.33:
+        return model_direction, "模型与技术规则方向一致，未采用近期多数类的震荡基线"
+    return blended_direction, ""
+
+
 def _candidate_models() -> list[tuple[str, object]]:
     """返回适合中小样本、非线性量价关系的候选模型。"""
     return [
@@ -680,13 +776,22 @@ def _refit_model_ensemble(ensemble: dict, x_train: pd.DataFrame, y_train: pd.Ser
 
 def _extract_ensemble_probs(ensemble: dict, feature_row: pd.Series) -> dict:
     """按验证质量权重融合已训练候选模型的三分类概率。"""
-    blended = {label: 0.0 for label in LABELS}
-    feature_frame = feature_row[FEATURE_COLUMNS].to_frame().T
+    probability_frame = _extract_ensemble_probability_frame(
+        ensemble,
+        feature_row[FEATURE_COLUMNS].to_frame().T,
+    )
+    return _normalize_probs(probability_frame.iloc[0].to_dict())
+
+
+def _extract_ensemble_probability_frame(ensemble: dict, feature_frame: pd.DataFrame) -> pd.DataFrame:
+    """批量融合已训练候选模型概率，供滚动回测减少逐行模型调用。"""
+    aligned_features = feature_frame[FEATURE_COLUMNS]
+    blended = pd.DataFrame(0.0, index=aligned_features.index, columns=LABELS)
     for item in ensemble["models"]:
-        probabilities = _aligned_probability_frame(item["model"], feature_frame).iloc[0]
-        for label in LABELS:
-            blended[label] += float(probabilities[label]) * float(item["weight"])
-    return _normalize_probs(blended)
+        probabilities = _aligned_probability_frame(item["model"], aligned_features)
+        blended = blended.add(probabilities * float(item["weight"]), fill_value=0.0)
+    row_sum = blended.sum(axis=1).replace(0, 1)
+    return blended.div(row_sum, axis=0)
 
 
 def _confidence_from_probs(probs: dict, cv_score: float | None, low_reliability: bool) -> str:
@@ -746,7 +851,12 @@ def _train_predict(data: pd.DataFrame, horizon: int, threshold: float, low_relia
         if ensemble is not None:
             raw_probs = _extract_ensemble_probs(ensemble, latest_feature)
             probs = _blend_probabilities(raw_probs, recent_probs, rule_probs, ensemble["cv_score"])
-            direction = max(probs, key=probs.get)
+            direction, direction_reason = _select_prediction_direction(
+                probs,
+                model_probs=raw_probs,
+                rule_probs=rule_probs,
+                model_score=ensemble["cv_score"],
+            )
             model_label = f"时间隔离加权集成（{ensemble['name']}）"
             return {
                 "周期": f"{horizon}日",
@@ -757,7 +867,14 @@ def _train_predict(data: pd.DataFrame, horizon: int, threshold: float, low_relia
                 "下跌概率": probs["下跌"],
                 "置信度": _confidence_from_probs(probs, ensemble["cv_score"], low_reliability),
                 "置信度说明": _confidence_reason(probs, ensemble["cv_score"], low_reliability, model_label),
-                "预测依据": _build_prediction_reason(latest_feature, direction, ensemble["cv_score"], ensemble["name"]),
+                "预测依据": "；".join(
+                    part
+                    for part in [
+                        direction_reason,
+                        _build_prediction_reason(latest_feature, direction, ensemble["cv_score"], ensemble["name"]),
+                    ]
+                    if part
+                ),
                 "主要支撑信号": strong_signals or _support_signals(latest_feature),
                 "主要风险信号": weak_signals or _risk_signals(latest_feature),
                 "风险提示": "历史数据不足，预测可靠性较低。" if low_reliability else "模型仅基于历史量价特征，无法覆盖突发消息和市场环境变化。",
@@ -828,6 +945,7 @@ def predict_short_term(
 ) -> dict:
     """输出未来 1-3 个交易日短线走势预测。"""
     hist_df = fetch_prediction_history(stock_code)
+    hist_df, target_dates, calendar_source, session_note = prepare_prediction_session(hist_df)
     normalized_mode = "adaptive" if threshold_mode == "adaptive" else "manual"
     feature_df = add_prediction_labels(
         build_features(hist_df),
@@ -835,7 +953,6 @@ def predict_short_term(
         threshold_mode=normalized_mode,
     )
     low_reliability = len(hist_df) < 250
-    target_dates, calendar_source = next_trade_dates(hist_df.iloc[-1]["date"], 3)
     latest_feature = feature_df.dropna(subset=FEATURE_COLUMNS).iloc[-1]
     horizons = [1, 2, 3]
     current_thresholds = {
@@ -865,6 +982,7 @@ def predict_short_term(
         "last_close": float(hist_df.iloc[-1]["close"]),
         "last_trade_date": pd.to_datetime(hist_df.iloc[-1]["date"]).strftime("%Y-%m-%d"),
         "calendar_source": calendar_source,
+        "prediction_session_note": session_note,
         "low_reliability": low_reliability,
         "data": feature_df,
         "predictions": predictions,
