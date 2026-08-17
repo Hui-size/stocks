@@ -1,6 +1,6 @@
 import pandas as pd
 
-from app import build_prediction_trend_figure, get_plotly_config, select_watchlist_stock
+from app import build_prediction_trend_figure, get_plotly_config, prediction_session_key, select_watchlist_stock
 
 
 def test_prediction_trend_chart_separates_history_and_forecast():
@@ -27,13 +27,14 @@ def test_prediction_trend_chart_separates_history_and_forecast():
     assert traces["预测情景中枢"].line.dash == "dash"
     assert traces["预测价位区间"].fill == "tonexty"
     assert len(traces["预测情景中枢"].x) == 4
+    assert figure.layout.legend.font.color
 
 
-def test_prediction_chart_uses_one_reliable_clear_action():
-    config = get_plotly_config(include_shape_eraser=False)
+def test_prediction_chart_supports_deleting_one_drawn_line_at_a_time():
+    config = get_plotly_config(include_shape_eraser=True)
 
     assert "drawline" in config["modeBarButtonsToAdd"]
-    assert "eraseshape" not in config["modeBarButtonsToAdd"]
+    assert "eraseshape" in config["modeBarButtonsToAdd"]
 
 
 def test_watchlist_selection_callback_updates_both_stock_states():
@@ -43,3 +44,8 @@ def test_watchlist_selection_callback_updates_both_stock_states():
 
     assert state["selected_stock"] == "002463"
     assert state["stock_code_input"] == "002463"
+
+
+def test_app_prediction_session_key_switches_at_shanghai_close():
+    assert prediction_session_key("2026-08-17 14:59:59+08:00") == "2026-08-17|before_close"
+    assert prediction_session_key("2026-08-17 15:00:00+08:00") == "2026-08-17|after_close"

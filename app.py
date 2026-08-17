@@ -21,7 +21,7 @@ from feedback import (
 from indicators import add_all_indicators
 from market import describe_market_sentiment, fetch_market_activity, get_major_indices
 from news import fetch_stock_announcements, fetch_stock_news
-from prediction import predict_short_term, prediction_session_key
+from prediction import predict_short_term
 from realtime import RealtimeQuoteError, compare_realtime_with_prediction, fetch_realtime_minute, fetch_realtime_quote
 from report import generate_markdown_report
 from scoring import build_score
@@ -35,6 +35,17 @@ THEME_COOKIE_NAME = "short_term_research_theme"
 ANALYSIS_PERIOD_COOKIE_NAME = "short_term_research_analysis_period"
 STOCK_CODE_COOKIE_NAME = "short_term_research_stock_code"
 PREFERENCE_COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 10
+
+
+def prediction_session_key(now=None) -> str:
+    """生成预测缓存时段键，避免云端热更新依赖跨模块新增符号。"""
+    current = pd.Timestamp.now(tz="Asia/Shanghai") if now is None else pd.Timestamp(now)
+    if current.tzinfo is None:
+        current = current.tz_localize("Asia/Shanghai")
+    else:
+        current = current.tz_convert("Asia/Shanghai")
+    phase = "after_close" if current.hour >= 15 else "before_close"
+    return f"{current:%Y-%m-%d}|{phase}"
 
 
 def get_saved_theme() -> str:
@@ -477,34 +488,6 @@ def apply_custom_theme(theme_mode: str | None = None) -> None:
         color: var(--button-text) !important;
     }
 
-    [class*="st-key-clear_prediction_trend_drawings_"] button {
-        min-height: 2.25rem;
-        padding: 0.4rem 0.8rem;
-        background: var(--panel-soft) !important;
-        border: 1px solid var(--line-strong) !important;
-        color: var(--text) !important;
-        box-shadow: none !important;
-    }
-
-    [class*="st-key-clear_prediction_trend_drawings_"] button * {
-        color: var(--text) !important;
-    }
-
-    [class*="st-key-clear_prediction_trend_drawings_"] button:hover {
-        background: var(--accent-soft) !important;
-        border-color: var(--accent) !important;
-    }
-
-    [class*="st-key-clear_prediction_trend_drawings_"] button:disabled {
-        background: var(--panel-soft) !important;
-        color: var(--muted) !important;
-        opacity: 0.72;
-    }
-
-    [class*="st-key-clear_prediction_trend_drawings_"] button:disabled * {
-        color: var(--muted) !important;
-    }
-
     .stCaptionContainer,
     caption,
     [data-testid="stCaptionContainer"] {
@@ -544,7 +527,12 @@ def style_plotly_figure(fig: go.Figure, height: int | None = None) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor=palette["chart"],
         font=dict(color=palette["text"], family="Arial"),
-        legend=dict(bgcolor=palette["legend"], bordercolor=palette["line"], borderwidth=1),
+        legend=dict(
+            bgcolor=palette["legend"],
+            bordercolor=palette["line"],
+            borderwidth=1,
+            font=dict(color=palette["text"]),
+        ),
         margin=dict(l=20, r=20, t=38, b=20),
     )
     fig.update_xaxes(showgrid=True, gridcolor=palette["grid"], zeroline=False)
@@ -1838,24 +1826,15 @@ def render_short_term_prediction(
         trend_figure = None
     if show_prediction_trend and trend_figure is not None:
         st.subheader("历史与未来 1-3 日走势")
-        chart_reset_key = f"prediction_trend_chart_reset_{code}"
-        chart_revision = int(st.session_state.get(chart_reset_key, 0))
-        if st.button(
-            "清除手动画线",
-            key=f"clear_prediction_trend_drawings_{code}",
-            help="清除你在这张走势图上手动画出的全部线条，不影响历史和预测数据。",
-        ):
-            chart_revision += 1
-            st.session_state[chart_reset_key] = chart_revision
         st.plotly_chart(
             trend_figure,
             use_container_width=True,
-            config=get_plotly_config(include_shape_eraser=False),
-            key=f"prediction_trend_chart_{code}_{chart_revision}",
+            config=get_plotly_config(include_shape_eraser=True),
+            key=f"prediction_trend_chart_{code}",
         )
         st.caption(
             "历史收盘价使用实线；未来虚线连接各周期预测价位区间的中枢，淡色带表示对应区间。"
-            "点击“清除手动画线”可一次清空你在图上添加的线条。"
+            "画线后如需逐条删除：先点要删除的手动画线，使其变浅表示已选中，再点工具栏橡皮擦。"
             "虚线不是确定收盘价或目标价，仅用于直观展示当前模型情景。"
         )
     elif show_prediction_trend:
